@@ -6,6 +6,7 @@
 #define MAX_ROWS 16
 #define MAX_COLS 64
 #define STRIDE 64
+#define BLOCK_SIZE 16   // maybe switch to 8 dependent on MM 
 
 
 /*
@@ -29,7 +30,30 @@ typedef struct __tile_config {
 } __tilecfg;
 
 
-// Initialise the tile config register
+
+// Initialise tile config register for bf16
+static void amx_tile_config_bf16(__tilecfg *cfg) {
+    cfg->palette_id = 1;
+    cfg->start_row = 0;
+
+    // tile C (FP32 accumulator)
+    cfg->rows[0] = BLOCK_SIZE;
+    cfg->colsb[0] = 64;         // 16 * 4 bytes
+
+    // tile A 
+    cfg->rows[1] = BLOCK_SIZE;
+    cfg->colsb[1] = 32;         // 16 * 2 bytes
+
+    // tile B
+    cfg->rows[2] = BLOCK_SIZE;
+    cfg->colsb[2] = 32;         // 16 * 2 bytes
+
+    _tile_loadconfig(&cfg);
+}
+
+
+
+// Initialise the tile config register for int8
 static void amx_tile_config_int8(__tilecfg *cfg) {
     cfg->palette_id = 1;
     cfg->start_row = 0;
@@ -84,6 +108,24 @@ static void amx_gemm_int8_16x16(const int8_t* restrict A, const int8_t* restrict
     _tile_release();                            // release tile config, also releases resources
 }
 
+/*================================================*/
+/* 
+BF16 microkernel
+*/
+static inline void amx_block_bf16_16x16_accumulate(const uint16_t* restrict A, const uint16_t* restrict B, float* restrict C, int ldc) {
+    _tile_load(0, C, ldc*sizeof(float));              // load existing C
+    _tile_load(1, A, BLOCK_SIZE*sizeof(uint16_t));    // load A
+    _tile_load(2, B, BLOCK_SIZE*sizeof(uint16_t));    // load B
+
+    _tile_dpbf16ps(0, 1, 2);    // C += A * B
+
+    _tile_stored(0, C, ldc * sizeof(float));
+}
+
+
+
+
+
 
 int main() {
     __tilecfg tile_data = {0};
@@ -99,7 +141,8 @@ int main() {
     }
 
     // load tile config
-    amx_tile_config_int8(&tile_data);
+    amx_tile_config_bf16(&tile_data);
+    // amx_tile_config_int8(&tile_data);
 
     // initialise src matrix buffers with data (untested- currently populated with 2s)
     init_buffer (A, 2);
