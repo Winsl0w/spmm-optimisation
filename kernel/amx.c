@@ -3,6 +3,7 @@
 #include <immintrin.h>
 #include <sys/syscall.h>
 #include <unistd.h>
+#include <stdio.h>
 
 #define MAX 1024
 #define MAX_ROWS 16
@@ -122,46 +123,11 @@ static void amx_gemm_int8_16x16(const int8_t* restrict A, const int8_t* restrict
 BF16 microkernel
 */
 static inline void amx_block_bf16_16x16_accumulate(const uint16_t* restrict A, const uint16_t* restrict B, float* restrict C, int ldc) {
-    _tile_load(0, C, ldc*sizeof(float));              // load existing C
-    _tile_load(1, A, BLOCK_SIZE*sizeof(uint16_t));    // load A
-    _tile_load(2, B, BLOCK_SIZE*sizeof(uint16_t));    // load B
+    _tile_loadd(0, C, ldc*sizeof(float));              // load existing C
+    _tile_loadd(1, A, BLOCK_SIZE*sizeof(uint16_t));    // load A
+    _tile_loadd(2, B, BLOCK_SIZE*sizeof(uint16_t));    // load B
 
     _tile_dpbf16ps(0, 1, 2);    // C += A * B
 
     _tile_stored(0, C, ldc * sizeof(float));
-}
-
-
-
-
-
-
-int main() {
-    __tilecfg tile_data = {0};
-    int8_t A[MAX];
-    int8_t B[MAX];
-    int32_t C[MAX/4];
-    int rows  = MAX_ROWS;
-    int colsb = MAX_COLS;
-
-    // request permission to use AMX
-    if (!set_tiledata_use()) {
-        exit(-1);
-    }
-
-    // load tile config
-    amx_tile_config_bf16(&tile_data);
-    // amx_tile_config_int8(&tile_data);
-
-    // initialise src matrix buffers with data (untested- currently populated with 2s)
-    init_buffer (A, 2);
-    print_buffer(A, rows, colsb);
-
-    init_buffer (B, 2);
-    print_buffer(B, rows, colsb);
-
-    // initialise destination matrix buffers with data
-    init_buffer32(C, 0);
-
-    amx_gemm_int8_16x16(A, B, C, 64);
 }
