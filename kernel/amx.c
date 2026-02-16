@@ -1,6 +1,8 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <immintrin.h>
+#include <sys/syscall.h>
+#include <unistd.h>
 
 #define MAX 1024
 #define MAX_ROWS 16
@@ -8,6 +10,10 @@
 #define STRIDE 64
 #define BLOCK_SIZE 16   // maybe switch to 8 dependent on MM 
 
+#define ARCH_GET_XCOMP_PERM     0x1022
+#define ARCH_REQ_XCOMP_PERM     0x1023
+#define XFEATURE_XTILECFG       17
+#define XFEATURE_XTILEDATA      18
 
 /*
     src1, src2 are the matrices being multiplied, tiles correspond to subdivisions of those matrices
@@ -74,9 +80,12 @@ static void amx_tile_config_int8(__tilecfg *cfg) {
 }
 
 
+// see https://www.kernel.org/doc/Documentation/x86/xstate.rst for syscall documentation
+
+
 // Request use of AMX from Linux kernel
 static bool set_tiledata_use() {
-    if (syscall(SYS_arch_prct1, ARCH_REQ_XCOMP_PERM, XFEATURE_XTILEDATA)) {
+    if (syscall(SYS_arch_prctl, ARCH_REQ_XCOMP_PERM, XFEATURE_XTILEDATA)) {
         printf("\n Failed to enable XFEATURE_XTILEDATA \n\n");
         return false;
     } else {
