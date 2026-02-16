@@ -1,24 +1,9 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <immintrin.h>
-
-#define MAX 1024
-#define MAX_ROWS 16
-#define MAX_COLS 64
-#define STRIDE 64
-#define BLOCK_SIZE 16   // maybe switch to 8 dependent on MM 
-
-
-/*
-    src1, src2 are the matrices being multiplied, tiles correspond to subdivisions of those matrices
-    res/dest is the destination matrix
-    in this current interation we handle int8, meaning the output matrix is populated with int32s
-
-    ideal:
-    C: 16 x 16
-    A: 16 x 64
-    B: 64 x 16
-*/
+#include <sys/syscall.h>
+#include <unistd.h>
+#include <stdio.h>
 
 // tile config register
 typedef struct __tile_config {
@@ -41,6 +26,5 @@ static bool set_tiledata_use();
 // Main int8 microkernel
 static void amx_gemm_int8_16x16(const int8_t* restrict A, const int8_t* restrict B, int32_t* restrict C, int K);
 
+// Main BCSR FP microkernel
 static inline void amx_block_bf16_16x16_accumulate(const uint16_t* restrict A, const uint16_t* restrict B, float* restrict C, int ldc);
-
-int main();
