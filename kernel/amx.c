@@ -16,6 +16,8 @@
 #define XFEATURE_XTILECFG       17
 #define XFEATURE_XTILEDATA      18
 
+static void print_buffer_float(float* buf, int32_t rows, int32_t colsb);
+
 /*
     src1, src2 are the matrices being multiplied, tiles correspond to subdivisions of those matrices
     res/dest is the destination matrix
@@ -120,7 +122,7 @@ static void amx_gemm_int8_16x16(const int8_t* restrict A, const int8_t* restrict
 
 /*================================================*/
 /* 
-BF16 microkernel
+BF16 BCSR microkernel
 */
 static inline void amx_block_bf16_16x16_accumulate(const uint16_t* restrict A, const uint16_t* restrict B, float* restrict C, int ldc) {
     _tile_loadd(0, C, ldc*sizeof(float));              // load existing C
@@ -130,4 +132,108 @@ static inline void amx_block_bf16_16x16_accumulate(const uint16_t* restrict A, c
     _tile_dpbf16ps(0, 1, 2);    // C += A * B
 
     _tile_stored(0, C, ldc * sizeof(float));
+    print_buffer_float(C,16, 16);
+    _tile_release();
+}
+
+//==============================================
+
+static float bf16_to_float(uint16_t bf) {
+    union {
+        uint32_t u;
+        float f;
+    } tmp;
+
+    tmp.u = ((uint32_t)bf) << 16;
+    return tmp.f;
+}
+
+
+static void init_buffer_bf16(uint16_t* buf, uint16_t value) {
+    int rows, colsb, i, j;
+    rows = MAX_ROWS;
+    colsb = MAX_COLS;
+
+    for (i = 0; i< rows; i++) {
+        for (j = 0; j< colsb; j++) {
+            buf[i + colsb + j] = value;
+        }
+    }
+}
+
+
+static void init_buffer_float(float* buf, float value) {
+    int rows, colsb, i, j;
+    rows = MAX_ROWS;
+    colsb = MAX_COLS;
+    int colsb2 = colsb/4;
+
+    for (i=0; i < rows; i++) {
+        for (j=0; j <(colsb2); j++) {
+            buf[i * colsb2 + j] = value;
+        }
+    }
+}
+
+
+/*
+Print source matrices (bf16)
+*/
+static void print_buffer_bf16(uint16_t* buf, int32_t rows, int32_t colsb) {
+    for (int i =0; i< rows; i++) {
+        for (int j=0;j<(colsb);j++) {
+            float val = bf16_to_float(buf[i * colsb + j]);
+            printf("%f ", val);
+        }
+        printf("\n");
+    }
+    printf("\n");
+}
+
+/*
+Print the resulting matrix (float)
+*/
+static void print_buffer_float(float* buf, int32_t rows, int32_t colsb) {
+    for (int i =0; i< rows; i++) {
+        for (int j=0;j<(colsb);j++) {
+            printf("%f ", buf[i * colsb + j]);
+        }
+        printf("\n");
+    }
+    printf("\n");
+}
+
+
+//================================================
+
+int main() {
+    __tilecfg tile_data = {0};
+    uint16_t src1[MAX];
+    uint16_t src2[MAX];
+    float res[MAX/4];
+    int rows = MAX_ROWS;
+    int colsb = MAX_COLS;
+
+    if (!set_tiledata_use()) {
+        exit(-1);
+    }
+
+    // load tile config
+    amx_tile_config_bf16 (&tile_data);
+
+    // initilialise source matrix buffers with dummy data
+    init_buffer_bf16(src1, 2);
+    print_buffer_bf16(src1, rows, colsb);
+
+    init_buffer_bf16(src2, 2);
+    print_buffer_bf16(src2, rows, colsb);
+
+    // initialise res matrix with zeroes
+    init_buffer_float(res, 0);
+
+    amx_block_bf16_16x16_accumulate(src1, src2, res, 256);
+
+
+
+
 }
