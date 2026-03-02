@@ -91,10 +91,13 @@ static bool set_tiledata_use() {
     if (syscall(SYS_arch_prctl, ARCH_REQ_XCOMP_PERM, XFEATURE_XTILEDATA)) {
         printf("\n Failed to enable XFEATURE_XTILEDATA \n\n");
         return false;
-    } else {
-        printf("\n TILE DATA USE SET - OK \n\n");
-        return true;
     }
+    if (syscall(SYS_arch_prctl, ARCH_REQ_XCOMP_PERM, XFEATURE_XTILECFG)) {
+        printf("\n Failed to enable XFEATURE_XTILECFG \n\n");
+        return false;
+    }
+    printf("\n TILE DATA USE SET - OK \n\n");
+    return true;
 }
 
 /*
