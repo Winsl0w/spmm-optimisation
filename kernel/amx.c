@@ -86,7 +86,7 @@ static void amx_tile_config_bf16(__tilecfg *cfg) {
     cfg->rows[2] = BLOCK_SIZE;
     cfg->colsb[2] = 32;         // 16 * 2 bytes
 
-    _tile_loadconfig(&cfg);
+    _tile_loadconfig(cfg);
 }
 
 
@@ -108,7 +108,7 @@ static void amx_tile_config_int8(__tilecfg *cfg) {
     cfg->rows[2] = 16;
     cfg->colsb[2] = 64;
 
-    _tile_loadconfig(&cfg);
+    _tile_loadconfig(cfg);
 }
 
 
@@ -188,7 +188,7 @@ static void init_buffer_bf16(uint16_t* buf, uint16_t value) {
 
     for (i = 0; i< rows; i++) {
         for (j = 0; j< colsb; j++) {
-            buf[i + colsb + j] = value;
+            buf[i * colsb + j] = value;
         }
     }
 }
@@ -263,7 +263,7 @@ int main() {
     // initialise res matrix with zeroes
     init_buffer_float(res, 0);
 
-    amx_block_bf16_16x16_accumulate(src1, src2, res, 256);
+    amx_block_bf16_16x16_accumulate(src1, src2, res, 16);
 
 
 
