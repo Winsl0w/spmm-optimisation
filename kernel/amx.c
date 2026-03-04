@@ -4,6 +4,8 @@
 #include <sys/syscall.h>
 #include <unistd.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 
 #define MAX 1024
 #define MAX_ROWS 16
@@ -17,6 +19,8 @@
 #define XFEATURE_XTILEDATA      18
 
 static void print_buffer_float(float* buf, int32_t rows, int32_t colsb);
+
+/* ================= TILE CONFIG ================= */
 
 /*
     src1, src2 are the matrices being multiplied, tiles correspond to subdivisions of those matrices
@@ -40,8 +44,10 @@ typedef struct __tile_config {
 
 
 
-// Initialise tile config register for bf16
+// BF16 tile configuration
 static void amx_tile_config_bf16(__tilecfg *cfg) {
+    memset(cfg, 0, sizeof(*cfg));
+
     cfg->palette_id = 1;
     cfg->start_row = 0;
 
@@ -83,6 +89,8 @@ static void amx_tile_config_int8(__tilecfg *cfg) {
 }
 
 
+/* ================= AMX PERMISSION ================= */
+
 // see https://www.kernel.org/doc/Documentation/x86/xstate.rst for syscall documentation
 
 
@@ -123,10 +131,9 @@ static void amx_gemm_int8_16x16(const int8_t* restrict A, const int8_t* restrict
     _tile_release();                            // release tile config, also releases resources
 }
 
-/*================================================*/
-/* 
-BF16 BCSR microkernel
-*/
+/* ================= BF16 MICROKERNEL ================= */
+ 
+//BF16 BCSR microkernel
 static inline void amx_block_bf16_16x16_accumulate(const uint16_t* restrict A, const uint16_t* restrict B, float* restrict C, int ldc) {
     _tile_loadd(0, C, ldc*sizeof(float));              // load existing C
     _tile_loadd(1, A, BLOCK_SIZE*sizeof(uint16_t));    // load A
@@ -139,7 +146,7 @@ static inline void amx_block_bf16_16x16_accumulate(const uint16_t* restrict A, c
     _tile_release();
 }
 
-//==============================================
+/* ================= HELPERS ================= */
 
 static float bf16_to_float(uint16_t bf) {
     union {
@@ -207,17 +214,18 @@ static void print_buffer_float(float* buf, int32_t rows, int32_t colsb) {
 }
 
 
-//================================================
+/* ================= MAIN ================= */
 
 int main() {
-    __tilecfg tile_data = {0};
-    uint16_t src1[MAX];
-    uint16_t src2[MAX];
-    float res[MAX/4];
+    __tilecfg tile_data __attribute__((aligned(64)));
+    uint16_t src1[MAX] __attribute__((aligned(64)));
+    uint16_t src2[MAX] __attribute__((aligned(64)));
+    float res[MAX/4] __attribute__((aligned(64)));
     int rows = MAX_ROWS;
     int colsb = MAX_COLS;
 
     if (!set_tiledata_use()) {
+        fprintf(stderr, "Failed to enable AMX\n");
         exit(-1);
     }
 
@@ -236,7 +244,5 @@ int main() {
 
     amx_block_bf16_16x16_accumulate(src1, src2, res, 256);
 
-
-
-
+    return 0;
 }
