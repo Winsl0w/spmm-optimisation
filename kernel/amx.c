@@ -41,6 +41,8 @@ typedef struct __tile_config {
     uint8_t reserved[14];   // reserved area
     uint16_t colsb[16];      // number of bytes per row for each tiledata register, max is 64
     uint8_t rows[16];        // number of rows for each tiledata register, max 16
+    uint16_t colsb[16];      // number of bytes per row for each tiledata register, max is 64
+    uint8_t rows[16];        // number of rows for each tiledata register, max 16
 } __tilecfg;
 
 
