@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <assert.h>
 
 #define MAX 1024
 #define MAX_ROWS 16
@@ -38,8 +39,8 @@ typedef struct __tile_config {
     uint8_t palette_id;     // 0 AMX deactivated, 1 provides 8kb internal storage with each tiledata register holding up to 1kb (16 rows x 64 bytes)
     uint8_t start_row;      // restart position if an operation is interrupted (page fault etc)
     uint8_t reserved[14];   // reserved area
-    uint16_t colsb[8];      // number of bytes per row for each tiledata register, max is 64
-    uint8_t rows[8];        // number of rows for each tiledata register, max 16
+    uint16_t colsb[16];      // number of bytes per row for each tiledata register, max is 64
+    uint8_t rows[16];        // number of rows for each tiledata register, max 16
 } __tilecfg;
 
 
@@ -121,13 +122,16 @@ static void amx_tile_config_bf16(__tilecfg *cfg) {
     cfg->rows[2] = BLOCK_SIZE;
     cfg->colsb[2] = 32;         // 16 * 2 bytes
 
-    _tile_loadconfig(&cfg);
+    _tile_release();            // release previous config if set (force XSAVE initialisation)
+    _tile_loadconfig(cfg);
 }
 
 
 
 // Initialise the tile config register for int8
 static void amx_tile_config_int8(__tilecfg *cfg) {
+    memset(cfg, 0, sizeof(*cfg));
+
     cfg->palette_id = 1;
     cfg->start_row = 0;
 
@@ -143,7 +147,8 @@ static void amx_tile_config_int8(__tilecfg *cfg) {
     cfg->rows[2] = 16;
     cfg->colsb[2] = 64;
 
-    _tile_loadconfig(&cfg);
+    _tile_release();             // release previous config if set (force XSAVE initialisation)
+    _tile_loadconfig(cfg);
 }
 
 
@@ -158,10 +163,10 @@ static bool set_tiledata_use() {
         printf("\n Failed to enable XFEATURE_XTILEDATA \n\n");
         return false;
     }
-    if (syscall(SYS_arch_prctl, ARCH_REQ_XCOMP_PERM, XFEATURE_XTILECFG)) {
-        printf("\n Failed to enable XFEATURE_XTILECFG \n\n");
-        return false;
-    }
+    // if (syscall(SYS_arch_prctl, ARCH_REQ_XCOMP_PERM, XFEATURE_XTILECFG)) {
+    //     printf("\n Failed to enable XFEATURE_XTILECFG \n\n");
+    //     return false;
+    // }
     printf("\n TILE DATA USE SET - OK \n\n");
     return true;
 }
@@ -193,9 +198,9 @@ static void amx_gemm_int8_16x16(const int8_t* restrict A, const int8_t* restrict
  
 //BF16 BCSR microkernel
 static inline void amx_block_bf16_16x16_accumulate(const uint16_t* restrict A, const uint16_t* restrict B, float* restrict C, int ldc) {
-    _tile_loadd(0, C, ldc*sizeof(float));              // load existing C
-    _tile_loadd(1, A, BLOCK_SIZE*sizeof(uint16_t));    // load A
-    _tile_loadd(2, B, BLOCK_SIZE*sizeof(uint16_t));    // load B
+    _tile_loadd(0, C, ldc*sizeof(float));            // load existing C
+    _tile_loadd(1, A, ldc*sizeof(uint16_t));          // load A
+    _tile_loadd(2, B, ldc*sizeof(uint16_t));          // load B
 
     _tile_dpbf16ps(0, 1, 2);    // C += A * B
 
@@ -220,11 +225,11 @@ static float bf16_to_float(uint16_t bf) {
 static void init_buffer_bf16(uint16_t* buf, uint16_t value) {
     int rows, colsb, i, j;
     rows = MAX_ROWS;
-    colsb = MAX_COLS;
+    colsb = 16;
 
     for (i = 0; i< rows; i++) {
         for (j = 0; j< colsb; j++) {
-            buf[i + colsb + j] = value;
+            buf[i * colsb + j] = value;
         }
     }
 }
@@ -275,7 +280,7 @@ static void print_buffer_float(float* buf, int32_t rows, int32_t colsb) {
 /* ================= MAIN ================= */
 
 int main() {
-    __tilecfg tile_data __attribute__((aligned(64)));
+    static __tilecfg tile_data __attribute__((aligned(64)));
     uint16_t src1[MAX] __attribute__((aligned(64)));
     uint16_t src2[MAX] __attribute__((aligned(64)));
     float res[MAX/4] __attribute__((aligned(64)));
@@ -286,6 +291,8 @@ int main() {
         fprintf(stderr, "Failed to enable AMX\n");
         exit(-1);
     }
+
+    assert(((unsigned long)&tile_data & 63) == 0);
 
     // load tile config
     amx_tile_config_bf16 (&tile_data);
@@ -300,7 +307,7 @@ int main() {
     // initialise res matrix with zeroes
     init_buffer_float(res, 0);
 
-    amx_block_bf16_16x16_accumulate(src1, src2, res, 256);
+    amx_block_bf16_16x16_accumulate(src1, src2, res, 16);
 
     return 0;
 }
