@@ -76,35 +76,6 @@ typedef struct {
 
 
 
-// =========================== Sparse format definitions =====================================
-
-/*
-    CSR (Compressed Sparse Row) format for bf16 matrices
-*/
-typedef struct {
-    int nrows;      // number of rows in the matrix
-    int ncols_tiles;    // number of column tiles (number of 64 column blocks)
-    int *rowptr;    // size nrows + 1
-    int *colidx;    // size = number of nonzeros
-    uint16_t *values;   // size = number of nonzeros, bf16 values
-} csr_matrix_bf16_t;
-
-
-/*
-    BCSR (Blocked Compressed Sparse Row) format for bf16 matrices
-*/
-typedef struct {
-    int nblockrows;      // number of rows in the matrix
-    int nblockcols_tiles;    // number of column tiles (number of 64 column blocks)
-    int *browptr;    // size nrows/BLOCK_SIZE + 1
-    int *bcolidx;    // size = number of nonzero blocks
-    uint16_t *values;   // size = number of nonzero blocks * BLOCK_SIZE * 64, bf16 values
-} bcsr_matrix_bf16_t;
-
-
-
-
-
 // BF16 tile configuration
 static void amx_tile_config_bf16(__tilecfg *cfg) {
     memset(cfg, 0, sizeof(*cfg));
