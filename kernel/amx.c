@@ -8,18 +8,21 @@
 #include <string.h>
 #include <assert.h>
 
-#define MAX 1024
-#define MAX_ROWS 16
-#define MAX_COLS 64
-#define STRIDE 64
-#define BLOCK_SIZE 16   // maybe switch to 8 dependent on MM 
+
+/*  ==============
+  *  Constants
+  * ============== */
+#define TILE_ROWS 16
+#define TILE_COLS 16        // bf16 elts per row in a tile
+#define TILE_COLSB_BF16 32  // bytes per row: 16 * sizeof(bf16)
+#define TILE_COLSB_F32 64   // bytes per row: 16 * sizeof(float)
+
 
 #define ARCH_GET_XCOMP_PERM     0x1022
 #define ARCH_REQ_XCOMP_PERM     0x1023
-#define XFEATURE_XTILECFG       17
 #define XFEATURE_XTILEDATA      18
 
-static void print_buffer_float(float* buf, int32_t rows, int32_t colsb);
+
 
 /* ================= TILE CONFIG ================= */
 
@@ -41,9 +44,31 @@ typedef struct __tile_config {
     uint8_t reserved[14];   // reserved area
     uint16_t colsb[16];      // number of bytes per row for each tiledata register, max is 64
     uint8_t rows[16];        // number of rows for each tiledata register, max 16
-    uint16_t colsb[16];      // number of bytes per row for each tiledata register, max is 64
-    uint8_t rows[16];        // number of rows for each tiledata register, max 16
 } __tilecfg;
+
+
+// BF16 tile configuration
+static void amx_config_bf16(void) {
+    __tilecfg cfg __attribute__((aligned(64)));
+    memset(&cfg, 0, sizeof(cfg));
+
+    cfg.palette_id = 1;
+    cfg.start_row = 0;
+
+    // tmm0: C (FP32 accumulator)
+    cfg.rows[0] = TILE_ROWS;
+    cfg.colsb[0] = TILE_COLSB_F32;        
+
+    // tmm1: A (BF16)
+    cfg.rows[1] = TILE_ROWS;
+    cfg.colsb[1] = TILE_COLSB_BF16;      
+
+    // tmm2: B (BF16)
+    cfg.rows[2] = TILE_ROWS;
+    cfg.colsb[2] = TILE_COLSB_BF16;    
+
+    _tile_loadconfig(&cfg);
+}
 
 
 
@@ -66,63 +91,12 @@ typedef struct {
 */
 typedef struct {
     int nblockrows;      // number of rows in the matrix
-    int nblockcols_tiles;    // number of column tiles (number of 64 column blocks)
+    int nblockcols;    // number of column tiles (number of 64 column blocks)
     int *browptr;    // size nrows/BLOCK_SIZE + 1
     int *bcolidx;    // size = number of nonzero blocks
-    uint16_t *values;   // size = number of nonzero blocks * BLOCK_SIZE * 64, bf16 values
+    uint16_t *blocks;   // size = number of nonzero blocks * BLOCK_SIZE * 64, bf16 values
 } bcsr_matrix_bf16_t;
 
-
-
-
-
-// BF16 tile configuration
-static void amx_tile_config_bf16(__tilecfg *cfg) {
-    memset(cfg, 0, sizeof(*cfg));
-
-    cfg->palette_id = 1;
-    cfg->start_row = 0;
-
-    // tile C (FP32 accumulator)
-    cfg->rows[0] = BLOCK_SIZE;
-    cfg->colsb[0] = 64;         // 16 * 4 bytes
-
-    // tile A 
-    cfg->rows[1] = BLOCK_SIZE;
-    cfg->colsb[1] = 32;         // 16 * 2 bytes
-
-    // tile B
-    cfg->rows[2] = BLOCK_SIZE;
-    cfg->colsb[2] = 32;         // 16 * 2 bytes
-
-    _tile_release();            // release previous config if set (force XSAVE initialisation)
-    _tile_loadconfig(cfg);
-}
-
-
-
-// Initialise the tile config register for int8
-static void amx_tile_config_int8(__tilecfg *cfg) {
-    memset(cfg, 0, sizeof(*cfg));
-
-    cfg->palette_id = 1;
-    cfg->start_row = 0;
-
-    // tile C (accumulator)
-    cfg->rows[0] = 16;
-    cfg->colsb[0] = 16;
-
-    // tile A 
-    cfg->rows[1] = 16;
-    cfg->colsb[1] = 64;
-
-    // tile B
-    cfg->rows[2] = 16;
-    cfg->colsb[2] = 64;
-
-    _tile_release();             // release previous config if set (force XSAVE initialisation)
-    _tile_loadconfig(cfg);
-}
 
 
 /* ================= AMX PERMISSION ================= */
@@ -131,7 +105,7 @@ static void amx_tile_config_int8(__tilecfg *cfg) {
 
 
 // Request use of AMX from Linux kernel
-static bool set_tiledata_use() {
+static bool request_amx_perm() {
     if (syscall(SYS_arch_prctl, ARCH_REQ_XCOMP_PERM, XFEATURE_XTILEDATA)) {
         printf("\n Failed to enable XFEATURE_XTILEDATA \n\n");
         return false;
@@ -144,143 +118,185 @@ static bool set_tiledata_use() {
     return true;
 }
 
-/*
-    A: pointer to top left element of submatrix of A
-    B: pointer to top left element of submatrix of B
-    C: pointer to top left element of submatrix of C
-    K: reduction dimension (shared by A and B) for this microkernel needs to be a multiple of 64
-*/
-// Main int8 microkernel
-static void amx_gemm_int8_16x16(const int8_t* restrict A, const int8_t* restrict B, int32_t* restrict C, int K) { 
-    // clear the accumulator
-    _tile_zero(0);
 
-    //#pragma loop vectorize(enable) unroll(full)
-    for (int i = 0; i < K; i += STRIDE) {       // walk through the matrix
-        _tile_loadd(1, A + i, STRIDE);          // load A into tmm1, address A+i moves pointer to column i, still points to row 0, rows handled through the STRIDE
-        _tile_loadd(2, B + i * STRIDE, STRIDE); // load B into tmm2, move down i rows, stay at column 0
-        _tile_dpbssd(0, 1, 2);
+
+/* ================= BF16 MICROKERNELS ================= */
+
+void csr_spmm_bf16(const csr_matrix_bf16_t* A, const uint16_t* B, float* C, int N) {
+    (void) N;
+
+    for (int i = 0; i < A->nrows; i++) {
+        /*  load existing output row into C
+         *  still use 16 row cfg however this means only row zero holds data
+         *  tile zeroed first then accumulate and store it */
+        _tile_zero(0);
+
+        for (int p = A->rowptr[i]; p < A->rowptr[i+1]; p++) {
+            int col_tile = A -> colidx[p];  // tile-col of B
+            uint16_t val_a = A->values[p];  // scalar value from A
+
+            uint16_t a_tile[TILE_ROWS * TILE_COLS] __attribute__((aligned(64)));
+            for (int k = 0; k < TILE_ROWS * TILE_COLS; k++) {
+                a_tile[k] = val_a;
+            }
+
+            const uint16_t* b_tile = B + col_tile * TILE_ROWS * TILE_COLS;
+
+            _tile_loadd(1, a_tile, TILE_COLSB_BF16);
+            _tile_loadd(2, b_tile, TILE_COLSB_BF16);
+            __asm__ volatile(".byte 0xc4, 0xe2, 0x73, 0x5c, 0xc2" ::: "memory");
+            // _tile_dpbf16ps(0, 1, 2);
+        }
+
+        float c_tile[TILE_ROWS * TILE_COLS] __attribute__((aligned(64)));
+        _tile_stored(0, c_tile, TILE_COLSB_F32);
+
+        float* c_row = C + i * TILE_COLS;
+        for (int j = 0; j < TILE_COLS; j++) {
+            c_row[j] += c_tile[j];
+        }
     }
-
-    _tile_stored(0, C, STRIDE);                 // writes contents of tmm0 to memory
-
-    _tile_release();                            // release tile config, also releases resources
 }
 
-/* ================= BF16 MICROKERNEL ================= */
- 
-//BF16 BCSR microkernel
-static inline void amx_block_bf16_16x16_accumulate(const uint16_t* restrict A, const uint16_t* restrict B, float* restrict C, int ldc) {
-    _tile_loadd(0, C, ldc*sizeof(float));            // load existing C
-    _tile_loadd(1, A, ldc*sizeof(uint16_t));          // load A
-    _tile_loadd(2, B, ldc*sizeof(uint16_t));          // load B
 
-    _tile_dpbf16ps(0, 1, 2);    // C += A * B
+void bcsr_spmm_bf16(const bcsr_matrix_bf16_t* A, const uint16_t* B, float* C) {
+    for (int br = 0; br < A->nblockrows; br++) {
+        float* c_tile = C + br * TILE_ROWS * TILE_COLS;
 
-    _tile_stored(0, C, ldc * sizeof(float));
-    print_buffer_float(C,16, 16);
-    _tile_release();
+        _tile_loadd(0, c_tile, TILE_COLSB_F32);
+
+        for (int p = A->browptr[br]; p < A->browptr[br + 1]; p++) {
+            int bc = A->bcolidx[p];
+            const uint16_t *a_block = A->blocks + (size_t)p *TILE_ROWS * TILE_COLS;
+            const uint16_t *b_block = B + (size_t)bc *TILE_ROWS * TILE_COLS;
+
+            _tile_loadd(1, a_block, TILE_COLSB_BF16);
+            _tile_loadd(2, b_block, TILE_COLSB_BF16);
+            _tile_dpbf16ps(0, 1, 2);
+        }
+
+        _tile_stored(0, c_tile, TILE_COLSB_F32);
+    }
 }
+
 
 /* ================= HELPERS ================= */
 
-static float bf16_to_float(uint16_t bf) {
-    union {
-        uint32_t u;
-        float f;
-    } tmp;
-
-    tmp.u = ((uint32_t)bf) << 16;
-    return tmp.f;
+static float bf16_to_float(uint16_t b) {
+    union {uint32_t u; float f;} temp;
+    temp.u = (uint32_t)b << 16;
+    return temp.f;
 }
 
-
-static void init_buffer_bf16(uint16_t* buf, uint16_t value) {
-    int rows, colsb, i, j;
-    rows = MAX_ROWS;
-    colsb = 16;
-
-    for (i = 0; i< rows; i++) {
-        for (j = 0; j< colsb; j++) {
-            buf[i * colsb + j] = value;
-        }
-    }
+static uint16_t float_to_bf16(float f) {
+    union {uint32_t u; float f;} temp;
+    temp.f = f;
+    return (uint16_t)(temp.u >> 16);
 }
 
-
-static void init_buffer_float(float* buf, float value) {
-    int rows, colsb, i, j;
-    rows = MAX_ROWS;
-    colsb = MAX_COLS;
-    int colsb2 = colsb/4;
-
-    for (i=0; i < rows; i++) {
-        for (j=0; j <(colsb2); j++) {
-            buf[i * colsb2 + j] = value;
-        }
-    }
-}
-
-
-/*
-Print source matrices (bf16)
-*/
-static void print_buffer_bf16(uint16_t* buf, int32_t rows, int32_t colsb) {
-    for (int i =0; i< rows; i++) {
-        for (int j=0;j<(colsb);j++) {
-            float val = bf16_to_float(buf[i * colsb + j]);
-            printf("%f ", val);
-        }
+static void print_f32_matrix(const char* lab, const float* M, int rows, int cols) {
+    printf("%s (%d x %d):\n", lab, rows, cols);
+    for (int i = 0; i < rows; i++) {
+        for (int j = 0; j < cols; j++) 
+            printf("%8.2f", M[i * cols + j]);
         printf("\n");
     }
     printf("\n");
 }
 
 /*
-Print the resulting matrix (float)
+ *  Test Harnesses
 */
-static void print_buffer_float(float* buf, int32_t rows, int32_t colsb) {
-    for (int i =0; i< rows; i++) {
-        for (int j=0;j<(colsb);j++) {
-            printf("%f ", buf[i * colsb + j]);
-        }
-        printf("\n");
+
+// CSR Test
+static void test_csr(void) {
+    printf("== CSR TEST ==\n\n");
+
+    int row_ptr[] = {0, 1, 2, 3, 4};
+    int col_idx[] = {0, 0, 0, 0};
+    uint16_t vals[4];
+    for (int i = 0; i < 4; i++) {
+        vals[i] = float_to_bf16(1.0f);
     }
-    printf("\n");
+
+    csr_matrix_bf16_t A = {
+        .nrows = 4,
+        .ncols_tiles = 1,
+        .rowptr = row_ptr,
+        .colidx = col_idx,
+        .values = vals,
+    };
+
+    uint16_t B[TILE_ROWS * TILE_COLS] __attribute__((aligned(64)));
+    memset(B, 0, sizeof(B));
+    for (int r = 0; r < TILE_ROWS; r++) {
+        B[r * TILE_COLS + r] = float_to_bf16((float)(r + 1));
+    }
+
+    float C[4 * TILE_COLS] __attribute__((aligned(64)));
+    memset(C, 0, sizeof(C));
+
+    csr_spmm_bf16(&A, B, C, TILE_COLS);
+
+    print_f32_matrix("C = A_csr * B", C, 4, TILE_COLS);
 }
+
+
+// BCSR Test
+static void test_bcsr(void) {
+    printf("== BCSR TEST ++ \n\n");
+
+    const int BLOCK = TILE_ROWS * TILE_COLS;
+
+    int brow_ptr[] = {0, 1, 2};
+    int bcol_idx[] = {0, 1};
+
+    uint16_t blocks[2 * BLOCK] __attribute__((aligned(64)));
+    for (int k = 0; k < 2 * BLOCK; k++) {
+        blocks[k] = float_to_bf16(1.0f);
+    }
+
+    bcsr_matrix_bf16_t A = {
+        .nblockrows = 2,
+        .nblockcols = 2,
+        .browptr = brow_ptr,
+        .bcolidx = bcol_idx,
+        .blocks = blocks,
+    };
+
+    uint16_t B[2 * BLOCK] __attribute__((aligned(64)));
+    memset(B, 0, sizeof(B));
+    for (int r = 0; r < TILE_ROWS; r++) {
+        B[0 * BLOCK + r * TILE_COLS + r] = float_to_bf16((float)(r + 1));
+        B[1 * BLOCK + r * TILE_COLS + r] = float_to_bf16((float)(10 * (r + 1)));
+    }
+
+    float C[2 * BLOCK] __attribute__((aligned(64)));
+    memset(C, 0, sizeof(C));
+
+    bcsr_spmm_bf16(&A, B, C);
+
+    print_f32_matrix("C block-row 0 = A[0,0]*B[0]", C, TILE_ROWS, TILE_COLS);
+    print_f32_matrix("C block-row 1 = A[1,1]*B[1]", C + BLOCK, TILE_ROWS, TILE_COLS);
+}
+
+
+
 
 
 /* ================= MAIN ================= */
 
 int main() {
-    static __tilecfg tile_data __attribute__((aligned(64)));
-    uint16_t src1[MAX] __attribute__((aligned(64)));
-    uint16_t src2[MAX] __attribute__((aligned(64)));
-    float res[MAX/4] __attribute__((aligned(64)));
-    int rows = MAX_ROWS;
-    int colsb = MAX_COLS;
-
-    if (!set_tiledata_use()) {
-        fprintf(stderr, "Failed to enable AMX\n");
+    if (!request_amx_perm()) {
         exit(-1);
     }
 
-    assert(((unsigned long)&tile_data & 63) == 0);
+    _tile_release();    // release previous config if set (force XSAVE initialisation)
+    amx_config_bf16();
 
-    // load tile config
-    amx_tile_config_bf16 (&tile_data);
+    test_csr();
+    test_bcsr();
 
-    // initilialise source matrix buffers with dummy data
-    init_buffer_bf16(src1, 2);
-    print_buffer_bf16(src1, rows, colsb);
-
-    init_buffer_bf16(src2, 2);
-    print_buffer_bf16(src2, rows, colsb);
-
-    // initialise res matrix with zeroes
-    init_buffer_float(res, 0);
-
-    amx_block_bf16_16x16_accumulate(src1, src2, res, 16);
-
+    _tile_release();
     return 0;
 }
