@@ -12,15 +12,42 @@
 /*  ==============
   *  Constants
   * ============== */
-#define TILE_ROWS 16
-#define TILE_COLS 16        // bf16 elts per row in a tile
-#define TILE_COLSB_BF16 32  // bytes per row: 16 * sizeof(bf16)
-#define TILE_COLSB_F32 64   // bytes per row: 16 * sizeof(float)
+#define TILE_C 0    // accumulator
+#define TILE_A 1    // A tile
+#define TILE_B 2    // B tile
 
 
-#define ARCH_GET_XCOMP_PERM     0x1022
-#define ARCH_REQ_XCOMP_PERM     0x1023
-#define XFEATURE_XTILEDATA      18
+#define TILE_MAX_ROWS 16
+#define TILE_MAX_BYTES 64
+#define TILE_MAX_BF16_COLS 32  // 64 bytes / 2
+#define TILE_MAX_F32_COLS 16   // 64 bytes / 4
+
+#define K_TILE 32           // num BF16 cols in A tile = num K elts processed per TDPBF16PS
+
+/* ================= AMX PERMISSION ================= */
+
+// see https://www.kernel.org/doc/Documentation/x86/xstate.rst for syscall documentation
+
+#ifndef ARCH_GET_XCOMP_PERM
+#define ARCH_GET_XCOMP_PERM 0x1022
+#endif
+#ifndef ARCH_REQ_XCOMP_PERM
+#define ARCH_REQ_XCOMP_PERM 0x1023
+#endif
+#ifndef XFEATURE_XTILEDATA
+#define XFEATURE_XTILEDATA 18
+#endif
+
+// Request use of AMX from Linux kernel
+static bool request_amx_perm() {
+    if (syscall(SYS_arch_prctl, ARCH_REQ_XCOMP_PERM, XFEATURE_XTILEDATA)) {
+        printf("\n Failed to enable XFEATURE_XTILEDATA \n\n");
+        return false;
+    }
+    
+    printf("\n TILE DATA USE SET - OK \n\n");
+    return true;
+}
 
 
 
@@ -96,27 +123,6 @@ typedef struct {
     int *bcolidx;    // size = number of nonzero blocks
     uint16_t *blocks;   // size = number of nonzero blocks * BLOCK_SIZE * 64, bf16 values
 } bcsr_matrix_bf16_t;
-
-
-
-/* ================= AMX PERMISSION ================= */
-
-// see https://www.kernel.org/doc/Documentation/x86/xstate.rst for syscall documentation
-
-
-// Request use of AMX from Linux kernel
-static bool request_amx_perm() {
-    if (syscall(SYS_arch_prctl, ARCH_REQ_XCOMP_PERM, XFEATURE_XTILEDATA)) {
-        printf("\n Failed to enable XFEATURE_XTILEDATA \n\n");
-        return false;
-    }
-    // if (syscall(SYS_arch_prctl, ARCH_REQ_XCOMP_PERM, XFEATURE_XTILECFG)) {
-    //     printf("\n Failed to enable XFEATURE_XTILECFG \n\n");
-    //     return false;
-    // }
-    printf("\n TILE DATA USE SET - OK \n\n");
-    return true;
-}
 
 
 
