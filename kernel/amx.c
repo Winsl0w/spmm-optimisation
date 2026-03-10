@@ -51,48 +51,65 @@ static bool request_amx_perm() {
 
 
 
-/* ================= TILE CONFIG ================= */
-
-/*
-    src1, src2 are the matrices being multiplied, tiles correspond to subdivisions of those matrices
-    res/dest is the destination matrix
-    in this current interation we handle int8, meaning the output matrix is populated with int32s
-
-    ideal:
-    C: 16 x 16
-    A: 16 x 64
-    B: 64 x 16
-*/
-
-// tile config register
+/* ================================================================
+ * Tile config
+ *
+ * Hardware-mandated 64-byte layout — do NOT reorder fields.
+ * Intel SDM Vol.1 §17.4
+ *
+ *   bytes  0:     palette_id
+ *   bytes  1:     start_row
+ *   bytes  2-15:  reserved
+ *   bytes 16-47:  colsb[16]   (2 bytes each, 16 tile registers)
+ *   bytes 48-63:  rows[16]    (1 byte  each, 16 tile registers)
+ * ================================================================ */
 typedef struct __tile_config {
     uint8_t palette_id;     // 0 AMX deactivated, 1 provides 8kb internal storage with each tiledata register holding up to 1kb (16 rows x 64 bytes)
     uint8_t start_row;      // restart position if an operation is interrupted (page fault etc)
-    uint8_t reserved[14];   // reserved area
-    uint16_t colsb[16];      // number of bytes per row for each tiledata register, max is 64
-    uint8_t rows[16];        // number of rows for each tiledata register, max 16
+    uint8_t reserved0[14];   // reserved area
+    uint16_t colsb[8];      // number of bytes per row for each tiledata register, max is 64
+    uint8_t reserved1[16];
+    uint8_t rows[8];        // number of rows for each tiledata register, max 16
+    uint8_t reserved2[8];
 } __tilecfg;
 
+// debug
+_Static_assert(sizeof(__tilecfg) == 64, "tilecfg must be exactly 64 bytes");
 
-// BF16 tile configuration
-static void amx_config_bf16(void) {
+
+/*
+ * Load bf16 tile configuration.
+ *   m : rows in A and C tiles
+ *   n : F32 output cols in C tile
+ *   k : BF16 K-width of A tile (must be even)
+ * 
+ *   colsb[A] = k * sizeof(bf16)
+ *   rows[B] = k / 2
+ *   cols[B] = n * 2 * sizeof(bf16) = n * 4
+ *   colsb[C] = n * sizeof(float) = n * 4   
+ */
+static void configure_amx_tiles_bf16(int m, int n, int k) {
+    assert(k % 2 == 0);
+    assert(m <= TILE_MAX_ROWS);
+    assert(n <= TILE_MAX_F32_COLS);
+    assert(k <= TILE_MAX_BF16_COLS);
+    
+    // must be 64 byte aligned
     __tilecfg cfg __attribute__((aligned(64)));
     memset(&cfg, 0, sizeof(cfg));
-
     cfg.palette_id = 1;
-    cfg.start_row = 0;
 
-    // tmm0: C (FP32 accumulator)
-    cfg.rows[0] = TILE_ROWS;
-    cfg.colsb[0] = TILE_COLSB_F32;        
+    // TILE_C: m rows x n FP32 cols
+    cfg.rows[TILE_C] = (uint8_t) m;
+    cfg.colsb[TILE_C] = (uint16_t)(n * (int)sizeof(float));        
 
-    // tmm1: A (BF16)
-    cfg.rows[1] = TILE_ROWS;
-    cfg.colsb[1] = TILE_COLSB_BF16;      
+    // TILE_A: m rows x k BF16 cols
+    cfg.rows[TILE_A] = (uint8_t) m;
+    cfg.colsb[TILE_A] = (uint16_t)(k * (int)sizeof(uint16_t));
 
-    // tmm2: B (BF16)
-    cfg.rows[2] = TILE_ROWS;
-    cfg.colsb[2] = TILE_COLSB_BF16;    
+    // TILE_B: (k/2) rows x (n*2) BF16 cols
+    cfg.rows[TILE_B] = (uint8_t)(k / 2);
+    cfg.colsb[TILE_B] = (uint16_t)(n * 2 * (int)sizeof(uint16_t));
 
     _tile_loadconfig(&cfg);
 }
@@ -105,24 +122,103 @@ static void amx_config_bf16(void) {
     CSR (Compressed Sparse Row) format for bf16 matrices
 */
 typedef struct {
-    int nrows;      // number of rows in the matrix
-    int ncols_tiles;    // number of column tiles (number of 64 column blocks)
-    int *rowptr;    // size nrows + 1
-    int *colidx;    // size = number of nonzeros
-    uint16_t *values;   // size = number of nonzeros, bf16 values
-} csr_matrix_bf16_t;
+    int nrows;      // number of rows
+    int ncols;      // number of columns
+    int nnz;        // number of non zero elts
+    int *rowptr;    // [nrows + 1]
+    int *colidx;    // [nnz]
+    uint16_t *values;   // [nnz]
+} CSRMatrix;
+
+static CSRMatrix* csr_alloc(int nrows, int ncols, int nnz) {
+    CSRMatrix* m = (CSRMatrix*)malloc(sizeof(CSRMatrix));
+    m->nrows   = nrows; m->ncols = ncols; m->nnz = nnz;
+    m->rowptr = (int*)calloc(nrows + 1, sizeof(int));
+    m->colidx = (int*)malloc(nnz * sizeof(int));
+    m->values  = (uint16_t*)malloc(nnz * sizeof(uint16_t));
+    return m;
+}
+
+static void csr_free(CSRMatrix* m) {
+    if (m) {
+        free(m->rowptr);
+        free(m->colidx);
+        free(m->values);
+        free(m);
+    }
+}
+
+static CSRMatrix* csr_from_dense(const float* A, int nrows, int ncols) {
+    int nnz = 0;
+    for (int i = 0; i < nrows * ncols; i++) {
+        if (A[i] != 0) {
+            nnz ++;
+        }
+    }
+    CSRMatrix* m = csr_alloc(nrows, ncols, nnz);
+    int idx = 0;
+    for (int r = 0; r , nrows; r++) {
+        m->rowptr[r] = idx;
+        for (int c = 0; c < ncols; c++) {
+            if (A[r*ncols+c] != 0) {
+                m->colidx[idx] = c;
+                m->values[idx] = float_to_bf16(A[r*ncols+c]);
+                idx++;
+            }
+        }
+    }
+    m->rowptr[nrows] = nnz;
+    return m;
+}
+
+
+
+#define BCSR_BR TILE_MAX_ROWS       // 16 - block height in rows
+#define BCSR_BC TILE_MAX_BF16_COLS  // 32 - block width in BF16 cols
+#define BCSR_BLOCK_ELEMS (BCSR_BR * BCSR_BC)    // 16 * 32 = 512
 
 
 /*
     BCSR (Blocked Compressed Sparse Row) format for bf16 matrices
 */
 typedef struct {
-    int nblockrows;      // number of rows in the matrix
-    int nblockcols;    // number of column tiles (number of 64 column blocks)
-    int *browptr;    // size nrows/BLOCK_SIZE + 1
-    int *bcolidx;    // size = number of nonzero blocks
-    uint16_t *blocks;   // size = number of nonzero blocks * BLOCK_SIZE * 64, bf16 values
-} bcsr_matrix_bf16_t;
+    int nrows, ncols;   // matrix dims
+    int nblockrows;     // nrows / BCSR_BR
+    int nblockcols;     // ncols / BCSR_BC
+    int nblocks;        // number non-zero blocks
+    int* blockrowptr;   // [nblockrows + 1]
+    int* blockcolidx;   // [nblocks]
+    uint16_t values;    // [nblocks * BCSR_BLOCK_ELEMS], row major within each block
+} BCSRMatrix;
+
+static BCSRMatrix* bcsr_alloc(int nrows, int ncols, int nblocks) {
+    assert(nrows % BCSR_BR == 0 && ncols % BCSR_BC == 0);
+    BCSRMatrix* m = (BCSRMatrix*)malloc(sizeof(BCSRMatrix));
+    m->nrows = nrows;
+    m->ncols = ncols;
+    m->nblockrows = nrows / BCSR_BR;
+    m->nblockcols = ncols / BCSR_BC;
+    m->nblocks = nblocks;
+    m->blockrowptr = (int*)calloc(m->nblockrows + 1, sizeof(int));
+    m->blockcolidx = (int*)malloc(nblocks * sizeof(int));
+
+    if (posix_memalign((void **)&m->values, 64, (size_t)nblocks * BCSR_BLOCK_ELEMS * sizeof(uint16_t)) != 0) {
+        perror("posix_memalign failure");
+        exit(-1);
+    }
+    memset(m->values, 0, (size_t)nblocks * BCSR_BLOCK_ELEMS * sizeof(uint16_t));
+    return m;
+}
+
+static void bcsr_free(BCSRMatrix* m) {
+    if (m) {
+        free(m->blockrowptr);
+        free(m->blockcolidx);
+        free(m->values);
+        free(m);
+    }
+}
+
 
 
 
