@@ -298,6 +298,32 @@ static inline float dense_f32_get(const DenseF32* m, int r, int c) {
 }
 
 
+/* ================= TILE BUFFERS ================= */
+
+static uint16_t global_a_buf[TILE_MAX_ROWS * K_TILE]__attribute__((aligned(64)));
+
+static uint16_t global_b_buf[(K_TILE/2) * (TILE_MAX_F32_COLS * 2)]__attribute__((aligned(64)));
+
+static float global_c_buf[TILE_MAX_ROWS * TILE_MAX_F32_COLS]__attribute__((aligned(64)));
+
+/* Interleave B rows into global buffer */
+static void pack_b_tile(const DenseBF16* B, int k0, int k_tile_bf16, int n0, int n_f32) {
+    int k_pairs = k_tile_bf16 / 2;
+    int b_stride = n_f32 * 2;
+    memset(global_b_buf, 0, k_pairs * b_stride * sizeof(uint16_t));
+    for (int kp = 0; kp < k_pairs; kp++) {
+        int k_even = k0 + 2 * kp;
+        int k_odd = k0 + 2 * kp + 1;
+        for (int j = 0; j < n_f32; j++) {
+            int n = n0 + j;
+            global_b_buf[kp * b_stride + 2 * j] = (k_even < B->rows && n < B->cols) ? dense_bf16_get(B, k_even, n) : 0;
+            global_b_buf[kp * b_stride + 2 * j + 1] = (k_odd < B->rows && n < B->cols) ? dense_bf16_get(B, k_odd, n) : 0;
+        }
+    }
+}
+
+
+
 /* ================= BF16 MICROKERNELS ================= */
 
 void csr_spmm_bf16(const csr_matrix_bf16_t* A, const uint16_t* B, float* C, int N) {
