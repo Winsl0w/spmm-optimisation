@@ -347,84 +347,6 @@ static void print_f32_matrix(const char* lab, const float* M, int rows, int cols
     printf("\n");
 }
 
-/*
- *  Test Harnesses
-*/
-
-// CSR Test
-static void test_csr(void) {
-    printf("== CSR TEST ==\n\n");
-
-    int row_ptr[] = {0, 1, 2, 3, 4};
-    int col_idx[] = {0, 0, 0, 0};
-    uint16_t vals[4];
-    for (int i = 0; i < 4; i++) {
-        vals[i] = float_to_bf16(1.0f);
-    }
-
-    csr_matrix_bf16_t A = {
-        .nrows = 4,
-        .ncols_tiles = 1,
-        .rowptr = row_ptr,
-        .colidx = col_idx,
-        .values = vals,
-    };
-
-    uint16_t B[TILE_ROWS * TILE_COLS] __attribute__((aligned(64)));
-    memset(B, 0, sizeof(B));
-    for (int r = 0; r < TILE_ROWS; r++) {
-        B[r * TILE_COLS + r] = float_to_bf16((float)(r + 1));
-    }
-
-    float C[4 * TILE_COLS] __attribute__((aligned(64)));
-    memset(C, 0, sizeof(C));
-
-    csr_spmm_bf16(&A, B, C, TILE_COLS);
-
-    print_f32_matrix("C = A_csr * B", C, 4, TILE_COLS);
-}
-
-
-// BCSR Test
-static void test_bcsr(void) {
-    printf("== BCSR TEST ++ \n\n");
-
-    const int BLOCK = TILE_ROWS * TILE_COLS;
-
-    int brow_ptr[] = {0, 1, 2};
-    int bcol_idx[] = {0, 1};
-
-    uint16_t blocks[2 * BLOCK] __attribute__((aligned(64)));
-    for (int k = 0; k < 2 * BLOCK; k++) {
-        blocks[k] = float_to_bf16(1.0f);
-    }
-
-    bcsr_matrix_bf16_t A = {
-        .nblockrows = 2,
-        .nblockcols = 2,
-        .browptr = brow_ptr,
-        .bcolidx = bcol_idx,
-        .blocks = blocks,
-    };
-
-    uint16_t B[2 * BLOCK] __attribute__((aligned(64)));
-    memset(B, 0, sizeof(B));
-    for (int r = 0; r < TILE_ROWS; r++) {
-        B[0 * BLOCK + r * TILE_COLS + r] = float_to_bf16((float)(r + 1));
-        B[1 * BLOCK + r * TILE_COLS + r] = float_to_bf16((float)(10 * (r + 1)));
-    }
-
-    float C[2 * BLOCK] __attribute__((aligned(64)));
-    memset(C, 0, sizeof(C));
-
-    bcsr_spmm_bf16(&A, B, C);
-
-    print_f32_matrix("C block-row 0 = A[0,0]*B[0]", C, TILE_ROWS, TILE_COLS);
-    print_f32_matrix("C block-row 1 = A[1,1]*B[1]", C + BLOCK, TILE_ROWS, TILE_COLS);
-}
-
-
-
 
 
 /* ================= MAIN ================= */
@@ -433,13 +355,5 @@ int main() {
     if (!request_amx_perm()) {
         exit(-1);
     }
-
-    _tile_release();    // release previous config if set (force XSAVE initialisation)
-    amx_config_bf16();
-
-    test_csr();
-    test_bcsr();
-
-    _tile_release();
     return 0;
 }
