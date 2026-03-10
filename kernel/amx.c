@@ -220,6 +220,82 @@ static void bcsr_free(BCSRMatrix* m) {
 }
 
 
+// =========================== Dense definitions =====================================
+
+/*
+    Dense BF16 matrices (tile B)
+*/
+typedef struct {
+    int rows;
+    int cols;
+    int stride; // BF16 elts per row
+    uint16_t* data;
+} DenseBF16;
+
+static DenseBF16* dense_bf16_alloc(int rows, int cols) {
+    DenseBF16* m = (DenseBF16*)malloc(sizeof(DenseBF16));
+    m->rows = rows;
+    m->cols = cols;
+    m->stride = (cols + 31) & ~31; // round up to nearest mult of 32
+    size_t size = (size_t)rows * m->stride * sizeof(uint16_t);
+    if (posix_memalign((void **)&m->data, 64, size) != 0) {
+        perror("posix_memalign failure"); 
+        exit(-1);
+    }
+    memset(m->data, 0, size);
+    return m;
+}
+
+static void dense_bf16_free(DenseBF16* m) {
+    if (m) {
+        free(m->data);
+        free(m);
+    }
+}
+
+static inline uint16_t dense_bf16_get(const DenseBF16* m, int r, int c) {
+    return m->data[r * m->stride + c];
+}
+
+static inline void dense_bf16_set(DenseBF16* m, int r, int c, uint16_t v) {
+    m->data[r * m->stride + c];
+}
+
+
+/*
+    Dense F32 matrices (tile C)
+*/
+typedef struct {
+    int rows;
+    int cols;
+    int stride;
+    float* data;
+} DenseF32;
+
+static DenseF32* dense_f32_alloc(int rows, int cols) {
+    DenseF32* m = (DenseF32*)malloc(sizeof(DenseF32));
+    m->rows = rows;
+    m->cols = cols;
+    m->stride = (cols + 15) & ~15;
+    size_t size = (size_t)rows * m->stride * sizeof(float);
+    if (posix_memalign((void **)&m->data, 64, size) != 0) {
+        perror("posix_memalign failure");
+        exit(-1);
+    }
+    memset(m->data, 0, size);
+    return m;
+}
+
+static void dense_f32_free(DenseF32* m) {
+    if (m) {
+        free(m->data);
+        free(m);
+    }
+}
+
+static inline float dense_f32_get(const DenseF32* m, int r, int c) {
+    return m->data[r * m->stride + c];
+}
 
 
 /* ================= BF16 MICROKERNELS ================= */
