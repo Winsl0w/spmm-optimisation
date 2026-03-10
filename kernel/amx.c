@@ -323,67 +323,6 @@ static void pack_b_tile(const DenseBF16* B, int k0, int k_tile_bf16, int n0, int
 }
 
 
-
-/* ================= BF16 MICROKERNELS ================= */
-
-void csr_spmm_bf16(const csr_matrix_bf16_t* A, const uint16_t* B, float* C, int N) {
-    (void) N;
-
-    for (int i = 0; i < A->nrows; i++) {
-        /*  load existing output row into C
-         *  still use 16 row cfg however this means only row zero holds data
-         *  tile zeroed first then accumulate and store it */
-        _tile_zero(0);
-
-        for (int p = A->rowptr[i]; p < A->rowptr[i+1]; p++) {
-            int col_tile = A -> colidx[p];  // tile-col of B
-            uint16_t val_a = A->values[p];  // scalar value from A
-
-            uint16_t a_tile[TILE_ROWS * TILE_COLS] __attribute__((aligned(64)));
-            for (int k = 0; k < TILE_ROWS * TILE_COLS; k++) {
-                a_tile[k] = val_a;
-            }
-
-            const uint16_t* b_tile = B + col_tile * TILE_ROWS * TILE_COLS;
-
-            _tile_loadd(1, a_tile, TILE_COLSB_BF16);
-            _tile_loadd(2, b_tile, TILE_COLSB_BF16);
-            __asm__ volatile(".byte 0xc4, 0xe2, 0x73, 0x5c, 0xc2" ::: "memory");
-            // _tile_dpbf16ps(0, 1, 2);
-        }
-
-        float c_tile[TILE_ROWS * TILE_COLS] __attribute__((aligned(64)));
-        _tile_stored(0, c_tile, TILE_COLSB_F32);
-
-        float* c_row = C + i * TILE_COLS;
-        for (int j = 0; j < TILE_COLS; j++) {
-            c_row[j] += c_tile[j];
-        }
-    }
-}
-
-
-void bcsr_spmm_bf16(const bcsr_matrix_bf16_t* A, const uint16_t* B, float* C) {
-    for (int br = 0; br < A->nblockrows; br++) {
-        float* c_tile = C + br * TILE_ROWS * TILE_COLS;
-
-        _tile_loadd(0, c_tile, TILE_COLSB_F32);
-
-        for (int p = A->browptr[br]; p < A->browptr[br + 1]; p++) {
-            int bc = A->bcolidx[p];
-            const uint16_t *a_block = A->blocks + (size_t)p *TILE_ROWS * TILE_COLS;
-            const uint16_t *b_block = B + (size_t)bc *TILE_ROWS * TILE_COLS;
-
-            _tile_loadd(1, a_block, TILE_COLSB_BF16);
-            _tile_loadd(2, b_block, TILE_COLSB_BF16);
-            _tile_dpbf16ps(0, 1, 2);
-        }
-
-        _tile_stored(0, c_tile, TILE_COLSB_F32);
-    }
-}
-
-
 /* ================= HELPERS ================= */
 
 static float bf16_to_float(uint16_t b) {
