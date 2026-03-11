@@ -395,62 +395,121 @@ static void amx_spmm_csr(const CSRMatrix* A, const DenseBF16* B, DenseF32* C) {
     BCSR MICROKERNEL
  * =================================================== */ 
 
+/* Block cache for the microkernel
+   packs every unique (bc, n_block) combo into the interleaved layout once, so that the packing function
+   is never called redundantly */ 
+#define B_CACHE_TILE_BF16 ((BCSR_BC / 2) * (TILE_MAX_F32_COLS * 2))
+
 static void amx_spmm_bcsr(const BCSRMatrix* A, const DenseBF16* B, DenseF32* C) {
     assert(A->ncols == B->rows && A->nrows == C->rows && B->cols == C->cols);
 
-    int M = A->nrows, N = B->cols;
+    int N = B->cols;
+    int n_blocks = (N + TILE_MAX_F32_COLS - 1) / TILE_MAX_F32_COLS;
+    int nblockcols = A->nblockcols;
 
-    // zero output
-    for (int r = 0; r < M; r++) {
-        memset(&C->data[r * C->stride], 0, C->cols * sizeof(float));    
+    // zero output 
+    for (int r = 0; r < A->nrows; r++) {
+        memset(&C->data[r * C->stride], 0, C->cols * sizeof(float));
     }
 
-    // outer loop tiles the N (output column) dimension
-    // each N tile produces TILE_MAX_F32_COLS F32 output columns
-    for (int n0 = 0; n0 < N; n0 += TILE_MAX_F32_COLS) {
-        int n_tile_f32 = (n0 + TILE_MAX_F32_COLS <= N) ? TILE_MAX_F32_COLS : N - n0;
+    // bcachedata is a flat array of nblockcols x n_blocks tiles, each B_CACHE_TILE_BF16 BF16 elements
+    uint16_t* bcachedata = NULL;
+    size_t cacheelems = (size_t)nblockcols * n_blocks * B_CACHE_TILE_BF16;
+    size_t cachebytes = cacheelems * sizeof(uint16_t);
 
-        // inner loop iterates through the block rows of A
-        // each block row, br, covers output rows [br*BCSR_VR ... (br+1)*BCSR_BR]
-        // this is always a full tile in M in this program as BCSR_BR = TILE_MAX_ROWS
-        for (int br = 0; br < A->nblockrows; br++) {
+    // we only want to pre pack B into the cache if it fits within 512 MB, otherwise we can do it on the fly
+    int use_cache = (cachebytes <= (size_t)512 * 1024 * 1024);
+    if (use_cache) {
+        if (posix_memalign((void **)&bcachedata, 64, cachebytes) != 0) {
+            perror("posix_memalign b_cache");
+            use_cache = 0;
+        } else {
+            memset(bcachedata, 0, cachebytes);
+        }
+    }
+    if (!use_cache) printf(" [b_cache] %.0f MB > 512 MB, packing B on the fly\n", cachebytes / 1.0e6);
+
+    if (use_cache) {
+        for (int bc = 0; bc < nblockcols; bc++) {
+            int k0 = bc * BCSR_BC;
+            for (int np = 0; np < n_blocks; np++) {
+                int n0 = np * TILE_MAX_F32_COLS;
+                int n_tile_f32 = (n0 + TILE_MAX_F32_COLS <= N) ? TILE_MAX_F32_COLS : N - n0;
+                uint16_t* dst = bcachedata + ((size_t)bc * n_blocks + np) * B_CACHE_TILE_BF16;
+                int k_pairs = BCSR_BC / 2;
+                for (int kp = 0; kp < k_pairs; kp++) {
+                    int k_even = k0 +2 * kp;
+                    int k_odd = k0 +2 * kp + 1;
+                    for (int j = 0; j < n_tile_f32; j++) {
+                        int n = n0 + j;
+                        dst[kp * (TILE_MAX_F32_COLS * 2) + 2 * j] = (k_even < B->rows) ? dense_bf16_get(B, k_even, n) : 0;
+                        dst[kp * (TILE_MAX_F32_COLS * 2) + 2 * j + 1] = (k_odd < B->rows) ? dense_bf16_get(B, k_odd, n) : 0;
+                    }
+                }
+            }
+        }
+    }
+
+    // compute loop
+    for (int br = 0; br < A->nblockrows; br++) {
+        int block_start = A->blockrowptr[br];
+        int block_end = A->blockrowptr[br + 1];
+        if (block_start == block_end) continue;
+
+        for (int np = 0; np < n_blocks; np++) {
+            int n0 = np * TILE_MAX_F32_COLS;
+            int n_tile_f32 = (n0 + TILE_MAX_F32_COLS <= N) ? TILE_MAX_F32_COLS : N - n0;
+            
             configure_amx_tiles_bf16(BCSR_BR, n_tile_f32, BCSR_BC);
             memset(global_c_buf, 0, sizeof(global_c_buf));
             _tile_loadd(TILE_C, global_c_buf, TILE_MAX_F32_COLS * (int)sizeof(float));
 
-            // accumulate nnz blocks in this row of blocks
-            for (int bi = A->blockrowptr[br]; bi < A->blockrowptr[br+1]; bi++) {
+            for (int bi = block_start; bi < block_end; bi++) {
                 int bc = A->blockcolidx[bi];
-                int k0 = bc * BCSR_BC;  // first K index of this block col
 
                 const uint16_t* a_block = A->values + (size_t)bi * BCSR_BLOCK_ELEMS;
                 _tile_loadd(TILE_A, a_block, BCSR_BC * (int)sizeof(uint16_t));
 
-                pack_b_tile(B, k0, BCSR_BC, n0, n_tile_f32);
-                _tile_loadd(TILE_B, global_b_buf, n_tile_f32 * 2 * (int)sizeof(uint16_t));
+                const uint16_t* b_tile;
+                if (use_cache) {
+                    b_tile = bcachedata + ((size_t)bc * n_blocks + np) * B_CACHE_TILE_BF16;
+                } else {
+                    // pack on the fly
+                    int k0_bi = bc * BCSR_BC;
+                    int k_pairs = BCSR_BC / 2;
+                    for (int kp = 0; kp < k_pairs; kp++) {
+                        int k_even = k0_bi + 2*kp;
+                        int k_odd  = k0_bi + 2*kp + 1;
+                        for (int j = 0; j < n_tile_f32; j++) {
+                            int n = n0 + j;
+                            global_b_buf[kp*(TILE_MAX_F32_COLS * 2) + 2 * j  ] = (k_even < B->rows) ? dense_bf16_get(B, k_even,n) : 0;
+                            global_b_buf[kp * (TILE_MAX_F32_COLS * 2) + 2 * j + 1] = (k_odd  < B->rows) ? dense_bf16_get(B, k_odd, n) : 0;
+                        }
+                    }
+                    b_tile = global_b_buf;
+                }
+                _tile_loadd(TILE_B, b_tile, TILE_MAX_F32_COLS * 2 * (int)sizeof(uint16_t));
 
                 _tile_dpbf16ps(TILE_C, TILE_A, TILE_B);
 
                 _tile_stored(TILE_C, global_c_buf, TILE_MAX_F32_COLS * (int)sizeof(float));
 
-                // reload C after storing
-                if (bi + 1 < A->blockrowptr[br+1]) {
+                if (bi + 1 < block_end) {
                     configure_amx_tiles_bf16(BCSR_BR, n_tile_f32, BCSR_BC);
                     _tile_loadd(TILE_C, global_c_buf, TILE_MAX_F32_COLS * (int)sizeof(float));
                 }
             }
 
-            // scatter C tile into output matrix
             int row_base = br * BCSR_BR;
             for (int ii = 0; ii < BCSR_BR; ii++) {
                 int row = row_base + ii;
                 for (int jj = 0; jj < n_tile_f32; jj++) {
-                    int col = n0 + jj;
-                    C->data[row * C->stride + col] = global_c_buf[ii * TILE_MAX_F32_COLS + jj];
+                    C->data[row * C->stride + n0 + jj] = global_c_buf[ii * TILE_MAX_F32_COLS + jj];
                 }
             }
         }
     }
+    free(bcachedata);
     _tile_release();
 }
 
