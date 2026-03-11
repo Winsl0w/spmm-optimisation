@@ -480,6 +480,129 @@ static void print_f32_matrix(const char* lab, const float* M, int rows, int cols
 }
 
 
+/* ================= MTX READER ================= */
+
+#include <ctype.h>
+#include <dirent.h>
+#include <time.h>
+
+typedef struct {
+    int row;
+    int col;
+    float val;
+} CooEntry;
+
+static int coo_cmp(const void* a, const void* b) {
+    const CooEntry* x = (const CooEntry*)a;
+    const CooEntry* y = (const CooEntry*)b;
+    if (x->row != y->row) {
+        return x->row - y->row;
+    }
+    return x->col - y->col;
+}
+
+static CSRMatrix* mtx_read_to_csr(const char* path, int* nrows_out, int* ncols_out) {
+    FILE* f = fopen(path, "r");
+    if (!f) {
+        perror(path);
+        return NULL;
+    }
+
+    // parse the banner
+    char banner[256];
+    if (!fgets(banner, sizeof(banner), f)) {
+        fclose(f);
+        return NULL;
+    }
+    for (char* p = banner; *p; p++) {
+        *p = (char)tolower((unsigned char)*p);
+    }
+    int is_pattern = (strstr(banner, "pattern") != NULL);
+    int is_symmetric = (strstr(banner, "symmetric") != NULL) || (strstr(banner, "skew-symmetric") != NULL);
+
+    // skip any comments
+    char line[256];
+    do {
+        if (!fgets(line, sizeof(line), f)) {
+            fclose(f);
+            return NULL;
+        } 
+    } while (line[0] == '%');
+
+    // dimension header
+    int nrows, ncols;
+    long nnz_file;
+    if (sscanf(line, "%d %d %ld", &nrows, &ncols, &nnz_file) != 3) {
+        fprintf(stderr, "mtx: bad dimension in %s\n", path);
+        fclose(f);
+        return NULL;
+    }
+
+    long nnz_alloc = is_symmetric ? nnz_file * 2 : nnz_file;
+    CooEntry* coo = (CooEntry*)malloc((size_t)nnz_alloc * sizeof(CooEntry));
+    if (!coo) {
+        perror("malloc coo");
+        fclose(f);
+        return NULL;
+    }
+
+    long n = 0;
+    for (long e = 0; e < nnz_file; e++) {
+        if (!fgets(line, sizeof(line), f)) break;
+        int r, c;
+        float v = 1.0f;
+        if (is_pattern) {
+            if (sscanf(line, "%d %d", &r, &c) < 2) continue;
+        } else {
+            if (sscanf(line, "%d %d %f", &r, &c, &v) < 3) continue;
+        }
+        r--;
+        c--;
+        if (r < 0 || r >= nrows || c < 0 || c >= ncols) continue;
+        coo[n].row = r;
+        coo[n].col = c;
+        coo[n].val = v;
+        n++;
+        if (is_symmetric && r != c) {
+            coo[n].row = c;
+            coo[n].col = r;
+            coo[n].val = v;
+            n++;
+        }
+    }
+    fclose(f);
+
+    qsort(coo, (size_t)n, sizeof(CooEntry), coo_cmp);
+    long nnz = 0;
+    for (long i = 0; i < n; i++) {
+        if (nnz > 0 && coo[nnz-1].row == coo[i].row && coo[nnz-1].col) coo[nnz-1].val = coo[i].val;
+        else coo[nnz++] = coo[i];
+    }
+
+    CSRMatrix* m = csr_alloc(nrows, ncols, (int)nnz);
+
+    for (long i = 0; i < nnz; i++) {
+        m->rowptr[coo[i].row + 1]++;
+    }
+    for (int r = 0; r < nrows; r++) {
+        m->rowptr[r+1] += m->rowptr[r];
+    }
+
+    int* cursor = (int*)malloc((size_t)nrows * sizeof(int));
+    memcpy(cursor, m->rowptr, (size_t)nrows * sizeof(int));
+    for (long i = 0; i < nnz; i++) {
+        int pos = cursor[coo[i].row]++;
+        m->colidx[pos] = coo[i].col;
+        m->values[pos] = float_to_bf16(coo[i].val);
+    }
+    free(cursor);
+    free(coo);
+
+    *nrows_out = nrows;
+    *ncols_out = ncols;
+    return m;
+}
+
 
 /* ================= MAIN ================= */
 
