@@ -7,6 +7,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <assert.h>
+#include <linux/time.h>
 
 
 /*  ==============
@@ -188,7 +189,7 @@ typedef struct {
     int nblocks;        // number non-zero blocks
     int* blockrowptr;   // [nblockrows + 1]
     int* blockcolidx;   // [nblocks]
-    uint16_t values;    // [nblocks * BCSR_BLOCK_ELEMS], row major within each block
+    uint16_t* values;    // [nblocks * BCSR_BLOCK_ELEMS], row major within each block
 } BCSRMatrix;
 
 static BCSRMatrix* bcsr_alloc(int nrows, int ncols, int nblocks) {
@@ -479,12 +480,20 @@ static void print_f32_matrix(const char* lab, const float* M, int rows, int cols
     printf("\n");
 }
 
+static double now_sec(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + ts.tv_nsec * 1e-9;
+}
+
 
 /* ================= MTX READER ================= */
 
 #include <ctype.h>
 #include <dirent.h>
 #include <time.h>
+#include "../utility/mmio.h"
 
 typedef struct {
     int row;
@@ -502,98 +511,101 @@ static int coo_cmp(const void* a, const void* b) {
 }
 
 static CSRMatrix* mtx_read_to_csr(const char* path, int* nrows_out, int* ncols_out) {
-    FILE* f = fopen(path, "r");
-    if (!f) {
-        perror(path);
-        return NULL;
+    FILE *f = fopen(path, "r");
+    if (!f) { perror(path); return NULL; }
+
+    /* ---- 1. Parse banner ---- */
+    MM_typecode matcode;
+    int ret = mm_read_banner(f, &matcode);
+    if (ret != 0) {
+        fprintf(stderr, "%s: mm_read_banner failed (code %d)\n", path, ret);
+        fclose(f); return NULL;
     }
 
-    // parse the banner
-    char banner[256];
-    if (!fgets(banner, sizeof(banner), f)) {
-        fclose(f);
-        return NULL;
-    }
-    for (char* p = banner; *p; p++) {
-        *p = (char)tolower((unsigned char)*p);
-    }
-    int is_pattern = (strstr(banner, "pattern") != NULL);
-    int is_symmetric = (strstr(banner, "symmetric") != NULL) || (strstr(banner, "skew-symmetric") != NULL);
-
-    // skip any comments
-    char line[256];
-    do {
-        if (!fgets(line, sizeof(line), f)) {
-            fclose(f);
-            return NULL;
-        } 
-    } while (line[0] == '%');
-
-    // dimension header
-    int nrows, ncols;
-    long nnz_file;
-    if (sscanf(line, "%d %d %ld", &nrows, &ncols, &nnz_file) != 3) {
-        fprintf(stderr, "mtx: bad dimension in %s\n", path);
-        fclose(f);
-        return NULL;
+    /* only want sparse matrices */
+    if (!mm_is_sparse(matcode) || !mm_is_matrix(matcode)) {
+        fprintf(stderr, "%s: not a sparse coordinate matrix (type: %s)\n",
+                path, mm_typecode_to_str(matcode));
+        fclose(f); return NULL;
     }
 
-    long nnz_alloc = is_symmetric ? nnz_file * 2 : nnz_file;
-    CooEntry* coo = (CooEntry*)malloc((size_t)nnz_alloc * sizeof(CooEntry));
-    if (!coo) {
-        perror("malloc coo");
-        fclose(f);
-        return NULL;
+    if (mm_is_complex(matcode)) {
+        fprintf(stderr, "%s: complex matrices not supported\n", path);
+        fclose(f); return NULL;
     }
 
+    int is_pattern   = mm_is_pattern(matcode);
+    int is_symmetric = mm_is_symmetric(matcode) || mm_is_skew(matcode) || mm_is_hermitian(matcode);
+
+    /* ---- 2. Read dimensions ---- */
+    int nrows, ncols, nnz_file;
+    ret = mm_read_mtx_crd_size(f, &nrows, &ncols, &nnz_file);
+    if (ret != 0) {
+        fprintf(stderr, "%s: mm_read_mtx_crd_size failed (code %d)\n", path, ret);
+        fclose(f); return NULL;
+    }
+
+    /* ---- 3. Allocate COO ---- */
+    long nnz_alloc = is_symmetric ? (long)nnz_file * 2 : nnz_file;
+    CooEntry *coo  = (CooEntry *)malloc((size_t)nnz_alloc * sizeof(CooEntry));
+    if (!coo) { perror("malloc coo"); fclose(f); return NULL; }
+
+    /* ---- 4. Read entries via MMIO ---- */
     long n = 0;
-    for (long e = 0; e < nnz_file; e++) {
-        if (!fgets(line, sizeof(line), f)) break;
-        int r, c;
-        float v = 1.0f;
-        if (is_pattern) {
-            if (sscanf(line, "%d %d", &r, &c) < 2) continue;
-        } else {
-            if (sscanf(line, "%d %d %f", &r, &c, &v) < 3) continue;
+    for (int e = 0; e < nnz_file; e++) {
+        int    row, col;
+        double real_val = 0.0, imag_val = 0.0;
+        ret = mm_read_mtx_crd_entry(f, &row, &col, &real_val, &imag_val,
+                                    matcode);
+        if (ret != 0) {
+            fprintf(stderr, "%s: read error at entry %d (code %d)\n",
+                    path, e, ret);
+            break;
         }
-        r--;
-        c--;
-        if (r < 0 || r >= nrows || c < 0 || c >= ncols) continue;
-        coo[n].row = r;
-        coo[n].col = c;
-        coo[n].val = v;
-        n++;
-        if (is_symmetric && r != c) {
-            coo[n].row = c;
-            coo[n].col = r;
-            coo[n].val = v;
+        /* MMIO returns 1-based indices */
+        row--; col--;
+        if (row < 0 || row >= nrows || col < 0 || col >= ncols) continue;
+
+        float v = is_pattern ? 1.0f : (float)real_val;
+
+        coo[n].row = row; coo[n].col = col; coo[n].val = v; n++;
+
+        /* ---- 5. Mirror off-diagonal entries for symmetric storage ---- */
+        if (is_symmetric && row != col) {
+            coo[n].row = col; coo[n].col = row;
+            /* skew-symmetric: A[j][i] = -A[i][j] */
+            coo[n].val = mm_is_skew(matcode) ? -v : v;
             n++;
         }
     }
     fclose(f);
 
+    /* ---- 6. Sort, deduplicate, build CSR ---- */
     qsort(coo, (size_t)n, sizeof(CooEntry), coo_cmp);
+
     long nnz = 0;
     for (long i = 0; i < n; i++) {
-        if (nnz > 0 && coo[nnz-1].row == coo[i].row && coo[nnz-1].col) coo[nnz-1].val = coo[i].val;
-        else coo[nnz++] = coo[i];
+        if (nnz > 0 &&
+            coo[nnz-1].row == coo[i].row &&
+            coo[nnz-1].col == coo[i].col)
+            coo[nnz-1].val = coo[i].val;   /* last value wins on duplicate */
+        else
+            coo[nnz++] = coo[i];
     }
 
-    CSRMatrix* m = csr_alloc(nrows, ncols, (int)nnz);
+    CSRMatrix *m = csr_alloc(nrows, ncols, (int)nnz);
 
-    for (long i = 0; i < nnz; i++) {
+    for (long i = 0; i < nnz; i++)
         m->rowptr[coo[i].row + 1]++;
-    }
-    for (int r = 0; r < nrows; r++) {
+    for (int r = 0; r < nrows; r++)
         m->rowptr[r+1] += m->rowptr[r];
-    }
 
-    int* cursor = (int*)malloc((size_t)nrows * sizeof(int));
+    int *cursor = (int *)malloc((size_t)nrows * sizeof(int));
     memcpy(cursor, m->rowptr, (size_t)nrows * sizeof(int));
     for (long i = 0; i < nnz; i++) {
-        int pos = cursor[coo[i].row]++;
+        int pos         = cursor[coo[i].row]++;
         m->colidx[pos] = coo[i].col;
-        m->values[pos] = float_to_bf16(coo[i].val);
+        m->values[pos]  = float_to_bf16(coo[i].val);
     }
     free(cursor);
     free(coo);
@@ -604,11 +616,89 @@ static CSRMatrix* mtx_read_to_csr(const char* path, int* nrows_out, int* ncols_o
 }
 
 
+/* ================= CSR TO BCSR ================= */
+
+static BCSRMatrix *csr_to_bcsr(const CSRMatrix *csr)
+{
+    int nrows = ((csr->nrows + BCSR_BR - 1) / BCSR_BR) * BCSR_BR;
+    int ncols = ((csr->ncols + BCSR_BC - 1) / BCSR_BC) * BCSR_BC;
+    int nbr   = nrows / BCSR_BR;
+    int nbc   = ncols / BCSR_BC;
+
+    /* Pass 1: mark which (br, bc) blocks are non-zero.
+     * use a per-block-row byte array of width nbc.  nbc can be large */
+    char *row_nz = (char *)calloc((size_t)nbc, 1); /* reused per block-row */
+    if (!row_nz) { perror("calloc row_nz"); return NULL; }
+
+    /* First pass to count total non-zero blocks */
+    int nblocks = 0;
+    for (int br = 0; br < nbr; br++) {
+        int r0 = br * BCSR_BR;
+        int r1 = r0 + BCSR_BR < csr->nrows ? r0 + BCSR_BR : csr->nrows;
+        for (int r = r0; r < r1; r++)
+            for (int p = csr->rowptr[r]; p < csr->rowptr[r+1]; p++)
+                row_nz[csr->colidx[p] / BCSR_BC] = 1;
+        for (int bc = 0; bc < nbc; bc++)
+            if (row_nz[bc]) { nblocks++; row_nz[bc] = 0; } /* reset for reuse */
+    }
+
+    BCSRMatrix *m = bcsr_alloc(nrows, ncols, nblocks);
+    if (!m) { free(row_nz); return NULL; }
+
+    // Pass 2: build blockrowptr / blockcolidx.
+    int idx = 0;
+    for (int br = 0; br < nbr; br++) {
+        m->blockrowptr[br] = idx;
+        int r0 = br * BCSR_BR;
+        int r1 = r0 + BCSR_BR < csr->nrows ? r0 + BCSR_BR : csr->nrows;
+        for (int r = r0; r < r1; r++)
+            for (int p = csr->rowptr[r]; p < csr->rowptr[r+1]; p++)
+                row_nz[csr->colidx[p] / BCSR_BC] = 1;
+        for (int bc = 0; bc < nbc; bc++)
+            if (row_nz[bc]) { m->blockcolidx[idx++] = bc; row_nz[bc] = 0; }
+    }
+    m->blockrowptr[nbr] = nblocks;
+    free(row_nz);
+
+    // Pass 3: scatter CSR values into BCSR value blocks.
+    for (int r = 0; r < csr->nrows; r++) {
+        int br = r / BCSR_BR;
+        int lr = r % BCSR_BR;
+        int slice_lo = m->blockrowptr[br];
+        int slice_hi = m->blockrowptr[br + 1];
+        for (int p = csr->rowptr[r]; p < csr->rowptr[r+1]; p++) {
+            int c  = csr->colidx[p];
+            int bc = c / BCSR_BC;
+            int lc = c % BCSR_BC;
+            // Binary search for bc in blockcolidx[slice_lo .. slice_hi) 
+            int lo = slice_lo, hi = slice_hi;
+            while (lo < hi) {
+                int mid = (lo + hi) >> 1;
+                if      (m->blockcolidx[mid] < bc) lo = mid + 1;
+                else if (m->blockcolidx[mid] > bc) hi = mid;
+                else { lo = mid; break; }
+            }
+            // lo is now the index of block (br, bc) 
+            m->values[(size_t)lo * BCSR_BLOCK_ELEMS + lr * BCSR_BC + lc] =
+                csr->values[p];
+        }
+    }
+    return m;
+}
+
+
 /* ================= MAIN ================= */
 
 int main() {
-    if (!request_amx_perm()) {
-        exit(-1);
+    printf("Intel AMX BF16 spMM\n");
+    printf("====================\n");
+    printf("  sizeof(tilecfg_t)  = %zu  (must be 64)\n", sizeof(__tilecfg));
+    printf("  TILE_MAX_ROWS      = %d\n", TILE_MAX_ROWS);
+    printf("  TILE_MAX_FP32_COLS = %d\n", TILE_MAX_F32_COLS);
+    printf("  BCSR block         = %d x %d = %d BF16 elems (one full tile)\n\n", BCSR_BR, BCSR_BC, BCSR_BLOCK_ELEMS);
+
+    if (amx_request_permission() != 0) {
+        fprintf(stderr, "ERROR: Failed to enable AMX tile state.\n");
+        return 1;
     }
-    return 0;
 }
