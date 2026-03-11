@@ -323,6 +323,138 @@ static void pack_b_tile(const DenseBF16* B, int k0, int k_tile_bf16, int n0, int
 }
 
 
+/* ===================================================
+    CSR MICROKERNEL
+ * =================================================== */ 
+
+static void amx_spmm_csr(const CSRMatrix* A, const DenseBF16* B, DenseF32* C) {
+    assert(A->ncols == B->rows && A->nrows == C->rows && B->cols == C->cols);
+
+    int M = A->nrows, N = B->cols, K = A->ncols;
+
+    for (int r = 0; r < M; r++) {
+        memset(&C->data[r * C->stride], 0, C->cols * sizeof(float));
+    }
+
+    for (int m0 = 0; m0 < M; m0 += TILE_MAX_ROWS) {
+        int m_tile = (m0 + TILE_MAX_ROWS <= M) ? TILE_MAX_ROWS : M - m0;
+
+        for (int n0 = 0; n0 < N; n0 += TILE_MAX_F32_COLS) {
+            int n_tile_f32 = (n0 + TILE_MAX_F32_COLS <= N) ? TILE_MAX_F32_COLS : N - n0;
+            
+            configure_amx_tiles_bf16(m_tile, n_tile_f32, K_TILE);
+
+            // zero and load C tile
+            memset(global_c_buf, 0, sizeof(global_c_buf));
+            _tile_loadd(TILE_C, global_c_buf, TILE_MAX_F32_COLS * (int)sizeof(float));
+
+            for (int k0 = 0; k0 < K; k0 += K_TILE) {
+                int k_strip = (k0 + K_TILE <= K) ? K_TILE : K - k0;
+                int k_strip_padded = (k_strip + 1) & ~1; // round up to even for pairing
+
+                // build A: scatter nnzs from this k strip
+                memset(global_a_buf, 0, sizeof(global_a_buf));
+                for (int ii = 0; ii < m_tile; ii++) {
+                    int row = m0 + ii;
+                    for (int p = A->rowptr[row]; p < A->rowptr[row+1]; p++) {
+                        int k = A->colidx[p];
+                        if (k < k0 || k >= k0 + k_strip) continue;
+                        global_a_buf[ii * K_TILE + (k - k0)] = A->values[p];
+                    }
+                }
+
+                pack_b_tile(B, k0, k_strip_padded, n0, n_tile_f32);
+
+                // update tile config for actual k_strip_padded as it could differ from K_TILE on the final strip
+                configure_amx_tiles_bf16(m_tile, n_tile_f32, k_strip_padded);
+                _tile_loadd(TILE_C, global_c_buf, TILE_MAX_F32_COLS * (int)sizeof(float));
+                _tile_loadd(TILE_A, global_a_buf, K_TILE * (int)sizeof(uint16_t));
+                _tile_loadd(TILE_B, global_b_buf, n_tile_f32 * 2 * (int)sizeof(uint16_t));
+                _tile_dpbf16ps(TILE_C, TILE_A, TILE_B);
+
+                // save accumulator before reconfiguration
+                _tile_stored(TILE_C, global_c_buf, TILE_MAX_F32_COLS * (int)sizeof(float));
+            }
+
+            // scatter C tile results into output matrix
+            for (int ii = 0; ii < m_tile; ii++) {
+                int row = m0 + ii;
+                for (int jj = 0; jj < n_tile_f32; jj++) {
+                    int col = n0 + jj;
+                    C->data[row * C->stride + col] = global_c_buf[ii * TILE_MAX_F32_COLS + jj];
+                }
+            }
+        }
+    }
+    _tile_release();
+}
+
+
+/* ===================================================
+    BCSR MICROKERNEL
+ * =================================================== */ 
+
+static void amx_spmm_bcsr(const BCSRMatrix* A, const DenseBF16* B, DenseF32* C) {
+    assert(A->ncols == B->rows && A->nrows == C->rows && B->cols == C->cols);
+
+    int M = A->nrows, N = B->cols;
+
+    // zero output
+    for (int r = 0; r < M; r++) {
+        memset(&C->data[r * C->stride], 0, C->cols * sizeof(float));    
+    }
+
+    // outer loop tiles the N (output column) dimension
+    // each N tile produces TILE_MAX_F32_COLS F32 output columns
+    for (int n0 = 0; n0 < N; n0 += TILE_MAX_F32_COLS) {
+        int n_tile_f32 = (n0 + TILE_MAX_F32_COLS <= N) ? TILE_MAX_F32_COLS : N - n0;
+
+        // inner loop iterates through the block rows of A
+        // each block row, br, covers output rows [br*BCSR_VR ... (br+1)*BCSR_BR]
+        // this is always a full tile in M in this program as BCSR_BR = TILE_MAX_ROWS
+        for (int br = 0; br < A->nblockrows; br++) {
+            configure_amx_tiles_bf16(BCSR_BR, n_tile_f32, BCSR_BC);
+            memset(global_c_buf, 0, sizeof(global_c_buf));
+            _tile_loadd(TILE_C, global_c_buf, TILE_MAX_F32_COLS * (int)sizeof(float));
+
+            // accumulate nnz blocks in this row of blocks
+            for (int bi = A->blockrowptr[br]; bi < A->blockrowptr[br+1]; bi++) {
+                int bc = A->blockcolidx[bi];
+                int k0 = bc * BCSR_BC;  // first K index of this block col
+
+                const uint16_t* a_block = A->values + (size_t)bi * BCSR_BLOCK_ELEMS;
+                _tile_loadd(TILE_A, a_block, BCSR_BC * (int)sizeof(uint16_t));
+
+                pack_b_tile(B, k0, BCSR_BC, n0, n_tile_f32);
+                _tile_loadd(TILE_B, global_b_buf, n_tile_f32 * 2 * (int)sizeof(uint16_t));
+
+                _tile_dpbf16ps(TILE_C, TILE_A, TILE_B);
+
+                _tile_stored(TILE_C, global_c_buf, TILE_MAX_F32_COLS * (int)sizeof(float));
+
+                // reload C after storing
+                if (bi + 1 < A->blockrowptr[br+1]) {
+                    configure_amx_tiles_bf16(BCSR_BR, n_tile_f32, BCSR_BC);
+                    _tile_loadd(TILE_C, global_c_buf, TILE_MAX_F32_COLS * (int)sizeof(float));
+                }
+            }
+
+            // scatter C tile into output matrix
+            int row_base = br * BCSR_BR;
+            for (int ii = 0; ii < BCSR_BR; ii++) {
+                int row = row_base + ii;
+                for (int jj = 0; jj < n_tile_f32; jj++) {
+                    int col = n0 + jj;
+                    C->data[row * C->stride + col] = global_c_buf[ii * TILE_MAX_F32_COLS + jj];
+                }
+            }
+        }
+    }
+    _tile_release();
+}
+
+
+
 /* ================= HELPERS ================= */
 
 static float bf16_to_float(uint16_t b) {
