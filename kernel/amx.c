@@ -750,6 +750,108 @@ static BCSRMatrix *csr_to_bcsr(const CSRMatrix *csr)
 }
 
 
+// random seed for populating the dense matrix
+static uint32_t random_seed;
+
+static float random_float(void) {
+    random_seed = random_seed * 1664525u + 1013904223u;
+    return (float)(int32_t)random_seed / (float)(1u << 31);
+}
+
+
+/* ================= MTX EXTRACTION ================= */
+
+// run program on a single .mtx file
+static void run_mtx_file(const char* path, int embed_dim, int use_bcsr) {
+    printf("\n────────────────────────────────────────────────────────\n");
+    printf("  File : %s\n", path);
+
+    // load mtx to CSR
+    int nrows, ncols;
+    double t0 = now_sec();
+    CSRMatrix* A_csr = mtx_read_to_csr(path, &nrows, &ncols);
+    double t_load = now_sec() - t0;
+    if (!A_csr) return;
+    printf("Load : %.3f s\n", t_load);
+
+    // convert to BCSR 
+    BCSRMatrix* A_bcsr = NULL;
+    int B_rows, C_rows;     // effective dimensions, as the dimensions could be padded in bcsr
+    if (use_bcsr) {
+        t0 = now_sec();
+        A_bcsr = csr_to_bcsr(A_csr);
+        printf("CSR to BCSR : %.3f s (%d blocks, padded %dx%d to %dx%d)\n", now_sec() - t0, A_bcsr->nblocks, nrows, ncols, A_bcsr->nrows, A_bcsr->ncols);
+        B_rows = A_bcsr->ncols; // padded N must match kernel A.ncols
+        C_rows = A_bcsr->nrows; // padded M must match kernel A.nrows
+    } else {
+        B_rows = ncols;
+        C_rows = nrows;
+    }
+    printf("B : %d x %d  (N x embed_dim)\n", B_rows, embed_dim);
+    printf("C : %d x %d  (M x embed_dim)\n", C_rows, embed_dim);
+
+    random_seed = 0xABCD1234u;
+    DenseBF16* B = dense_bf16_alloc(B_rows, embed_dim);
+    for (int r = 0; r < ncols; r++) {
+        for (int c = 0; c < embed_dim; c++) {
+            dense_bf16_set(B, r, c, float_to_bf16(random_float() * 2.0f - 1.0f));
+        }
+    }
+
+    DenseF32* C_amx = dense_f32_alloc(C_rows, embed_dim);
+
+    t0 = now_sec();
+    if (use_bcsr) {
+        amx_spmm_bcsr(A_bcsr, B, C_amx);
+    } else {
+        amx_spmm_csr(A_bcsr, B, C_amx);
+    }
+    double elapsed = now_sec() - t0;
+    printf("AMX spMM : %.3f s", elapsed);
+
+    csr_free(A_csr);
+    bcsr_free(A_bcsr);
+    dense_bf16_free(B);
+    dense_f32_free(C_amx);
+}
+
+// run program on all .mtx files in a directory
+static void run_mtx_directory(const char* dir, int embed_dim, int use_bcsr) {
+    printf("\n========================================\n");
+    printf("Source Directory : %s\n", dir);
+    printf("embed_dim = %d,  format = %s\n",
+           embed_dim, use_bcsr ? "BCSR (tile blocks)" : "CSR");
+    printf("========================================\n");
+
+    DIR* d = opendir(dir);
+    if (!d) {
+        perror(dir); 
+        return;
+    }
+
+    struct dirent* ent;
+    int count = 0;
+    while ((ent = readdir(d) != NULL)) {
+        size_t len = strlen(ent->d_name);
+        if (len < 4 || strcmp(ent->d_name + len - 4, ".mtx") != 0) continue;
+        char fullpath[4096];
+        snprintf(fullpath, sizeof(fullpath), "%s/%s", dir, ent->d_name);
+        run_mtx_file(fullpath, embed_dim, use_bcsr);
+        count++;
+    }
+    closedir(d);
+
+    if (count == 0) {
+        printf("(no .mtx files found in %s)\n", dir);
+    } else {
+        printf("\nProcessed %d files.\n", count);
+    }
+}
+
+
+
+
+
 /* ================= MAIN ================= */
 
 int main() {
