@@ -500,6 +500,7 @@ static void amx_spmm_bcsr(const BCSRMatrix* A, const DenseBF16* B, DenseF32* C) 
                 }
             }
 
+            // scatter C tile into output matrix
             int row_base = br * BCSR_BR;
             for (int ii = 0; ii < BCSR_BR; ii++) {
                 int row = row_base + ii;
@@ -554,6 +555,7 @@ static double now_sec(void)
 #include <time.h>
 #include "../utility/mmio.h"
 
+// internal COO entry used during conversion to CSR
 typedef struct {
     int row;
     int col;
@@ -569,11 +571,12 @@ static int coo_cmp(const void* a, const void* b) {
     return x->col - y->col;
 }
 
+// Loads a .mtx file via mmio and returns a CSRMatrix
 static CSRMatrix* mtx_read_to_csr(const char* path, int* nrows_out, int* ncols_out) {
     FILE *f = fopen(path, "r");
     if (!f) { perror(path); return NULL; }
 
-    /* ---- 1. Parse banner ---- */
+    // Parse banner
     MM_typecode matcode;
     int ret = mm_read_banner(f, &matcode);
     if (ret != 0) {
@@ -581,13 +584,14 @@ static CSRMatrix* mtx_read_to_csr(const char* path, int* nrows_out, int* ncols_o
         fclose(f); return NULL;
     }
 
-    /* only want sparse matrices */
+    // sparse matrices only
     if (!mm_is_sparse(matcode) || !mm_is_matrix(matcode)) {
         fprintf(stderr, "%s: not a sparse coordinate matrix (type: %s)\n",
                 path, mm_typecode_to_str(matcode));
         fclose(f); return NULL;
     }
 
+    // probably not necessary
     if (mm_is_complex(matcode)) {
         fprintf(stderr, "%s: complex matrices not supported\n", path);
         fclose(f); return NULL;
@@ -596,7 +600,7 @@ static CSRMatrix* mtx_read_to_csr(const char* path, int* nrows_out, int* ncols_o
     int is_pattern   = mm_is_pattern(matcode);
     int is_symmetric = mm_is_symmetric(matcode) || mm_is_skew(matcode) || mm_is_hermitian(matcode);
 
-    /* ---- 2. Read dimensions ---- */
+    // read dimensions
     int nrows, ncols, nnz_file;
     ret = mm_read_mtx_crd_size(f, &nrows, &ncols, &nnz_file);
     if (ret != 0) {
@@ -604,12 +608,12 @@ static CSRMatrix* mtx_read_to_csr(const char* path, int* nrows_out, int* ncols_o
         fclose(f); return NULL;
     }
 
-    /* ---- 3. Allocate COO ---- */
+    // allocate COO, twice for symmetric storage
     long nnz_alloc = is_symmetric ? (long)nnz_file * 2 : nnz_file;
     CooEntry *coo  = (CooEntry *)malloc((size_t)nnz_alloc * sizeof(CooEntry));
     if (!coo) { perror("malloc coo"); fclose(f); return NULL; }
 
-    /* ---- 4. Read entries via MMIO ---- */
+    // read the entries
     long n = 0;
     for (int e = 0; e < nnz_file; e++) {
         int    row, col;
@@ -621,7 +625,7 @@ static CSRMatrix* mtx_read_to_csr(const char* path, int* nrows_out, int* ncols_o
                     path, e, ret);
             break;
         }
-        /* MMIO returns 1-based indices */
+        // mmio uses 1 indexing
         row--; col--;
         if (row < 0 || row >= nrows || col < 0 || col >= ncols) continue;
 
@@ -629,17 +633,17 @@ static CSRMatrix* mtx_read_to_csr(const char* path, int* nrows_out, int* ncols_o
 
         coo[n].row = row; coo[n].col = col; coo[n].val = v; n++;
 
-        /* ---- 5. Mirror off-diagonal entries for symmetric storage ---- */
+        // mirror off diagonal for symmetric storage
         if (is_symmetric && row != col) {
             coo[n].row = col; coo[n].col = row;
-            /* skew-symmetric: A[j][i] = -A[i][j] */
+            // skew-symmetric -> A[j][i] = -A[i][j]
             coo[n].val = mm_is_skew(matcode) ? -v : v;
             n++;
         }
     }
     fclose(f);
 
-    /* ---- 6. Sort, deduplicate, build CSR ---- */
+    // sort, remove duplicates and build CSR
     qsort(coo, (size_t)n, sizeof(CooEntry), coo_cmp);
 
     long nnz = 0;
@@ -647,7 +651,7 @@ static CSRMatrix* mtx_read_to_csr(const char* path, int* nrows_out, int* ncols_o
         if (nnz > 0 &&
             coo[nnz-1].row == coo[i].row &&
             coo[nnz-1].col == coo[i].col)
-            coo[nnz-1].val = coo[i].val;   /* last value wins on duplicate */
+            coo[nnz-1].val = coo[i].val;    // on duplicate, last value is kept
         else
             coo[nnz++] = coo[i];
     }
@@ -662,9 +666,9 @@ static CSRMatrix* mtx_read_to_csr(const char* path, int* nrows_out, int* ncols_o
     int *cursor = (int *)malloc((size_t)nrows * sizeof(int));
     memcpy(cursor, m->rowptr, (size_t)nrows * sizeof(int));
     for (long i = 0; i < nnz; i++) {
-        int pos         = cursor[coo[i].row]++;
+        int pos = cursor[coo[i].row]++;
         m->colidx[pos] = coo[i].col;
-        m->values[pos]  = float_to_bf16(coo[i].val);
+        m->values[pos] = float_to_bf16(coo[i].val);
     }
     free(cursor);
     free(coo);
@@ -686,10 +690,10 @@ static BCSRMatrix *csr_to_bcsr(const CSRMatrix *csr)
 
     /* Pass 1: mark which (br, bc) blocks are non-zero.
      * use a per-block-row byte array of width nbc.  nbc can be large */
-    char *row_nz = (char *)calloc((size_t)nbc, 1); /* reused per block-row */
+    char *row_nz = (char *)calloc((size_t)nbc, 1);          // reused per block-row 
     if (!row_nz) { perror("calloc row_nz"); return NULL; }
 
-    /* First pass to count total non-zero blocks */
+    // First pass to count total non-zero blocks
     int nblocks = 0;
     for (int br = 0; br < nbr; br++) {
         int r0 = br * BCSR_BR;
@@ -698,7 +702,7 @@ static BCSRMatrix *csr_to_bcsr(const CSRMatrix *csr)
             for (int p = csr->rowptr[r]; p < csr->rowptr[r+1]; p++)
                 row_nz[csr->colidx[p] / BCSR_BC] = 1;
         for (int bc = 0; bc < nbc; bc++)
-            if (row_nz[bc]) { nblocks++; row_nz[bc] = 0; } /* reset for reuse */
+            if (row_nz[bc]) { nblocks++; row_nz[bc] = 0; }  // reset for reuse
     }
 
     BCSRMatrix *m = bcsr_alloc(nrows, ncols, nblocks);
