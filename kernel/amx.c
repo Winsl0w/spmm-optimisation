@@ -1,3 +1,4 @@
+#define _GNU_SOURCE
 #include <stdint.h>
 #include <stdbool.h>
 #include <immintrin.h>
@@ -7,7 +8,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <assert.h>
-#include <linux/time.h>
+#include <time.h>
 
 
 /*  ==============
@@ -40,14 +41,14 @@
 #endif
 
 // Request use of AMX from Linux kernel
-static bool request_amx_perm() {
+static int request_amx_perm() {
     if (syscall(SYS_arch_prctl, ARCH_REQ_XCOMP_PERM, XFEATURE_XTILEDATA)) {
         printf("\n Failed to enable XFEATURE_XTILEDATA \n\n");
-        return false;
+        return 0;
     }
     
     printf("\n TILE DATA USE SET - OK \n\n");
-    return true;
+    return 1;
 }
 
 
@@ -115,6 +116,37 @@ static void configure_amx_tiles_bf16(int m, int n, int k) {
     _tile_loadconfig(&cfg);
 }
 
+
+/* ================= HELPERS ================= */
+
+static float bf16_to_float(uint16_t b) {
+    union {uint32_t u; float f;} temp;
+    temp.u = (uint32_t)b << 16;
+    return temp.f;
+}
+
+static uint16_t float_to_bf16(float f) {
+    union {uint32_t u; float f;} temp;
+    temp.f = f;
+    return (uint16_t)(temp.u >> 16);
+}
+
+static void print_f32_matrix(const char* lab, const float* M, int rows, int cols) {
+    printf("%s (%d x %d):\n", lab, rows, cols);
+    for (int i = 0; i < rows; i++) {
+        for (int j = 0; j < cols; j++) 
+            printf("%8.2f", M[i * cols + j]);
+        printf("\n");
+    }
+    printf("\n");
+}
+
+static double now_sec(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + ts.tv_nsec * 1e-9;
+}
 
 
 // =========================== Sparse format definitions =====================================
@@ -515,39 +547,6 @@ static void amx_spmm_bcsr(const BCSRMatrix* A, const DenseBF16* B, DenseF32* C) 
 }
 
 
-
-/* ================= HELPERS ================= */
-
-static float bf16_to_float(uint16_t b) {
-    union {uint32_t u; float f;} temp;
-    temp.u = (uint32_t)b << 16;
-    return temp.f;
-}
-
-static uint16_t float_to_bf16(float f) {
-    union {uint32_t u; float f;} temp;
-    temp.f = f;
-    return (uint16_t)(temp.u >> 16);
-}
-
-static void print_f32_matrix(const char* lab, const float* M, int rows, int cols) {
-    printf("%s (%d x %d):\n", lab, rows, cols);
-    for (int i = 0; i < rows; i++) {
-        for (int j = 0; j < cols; j++) 
-            printf("%8.2f", M[i * cols + j]);
-        printf("\n");
-    }
-    printf("\n");
-}
-
-static double now_sec(void)
-{
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (double)ts.tv_sec + ts.tv_nsec * 1e-9;
-}
-
-
 /* ================= MTX READER ================= */
 
 #include <ctype.h>
@@ -804,7 +803,7 @@ static void run_mtx_file(const char* path, int embed_dim, int use_bcsr) {
     if (use_bcsr) {
         amx_spmm_bcsr(A_bcsr, B, C_amx);
     } else {
-        amx_spmm_csr(A_bcsr, B, C_amx);
+        amx_spmm_csr(A_csr, B, C_amx);
     }
     double elapsed = now_sec() - t0;
     printf("AMX spMM : %.3f s", elapsed);
@@ -831,7 +830,7 @@ static void run_mtx_directory(const char* dir, int embed_dim, int use_bcsr) {
 
     struct dirent* ent;
     int count = 0;
-    while ((ent = readdir(d) != NULL)) {
+    while ((ent = readdir(d)) != NULL) {
         size_t len = strlen(ent->d_name);
         if (len < 4 || strcmp(ent->d_name + len - 4, ".mtx") != 0) continue;
         char fullpath[4096];
@@ -850,20 +849,45 @@ static void run_mtx_directory(const char* dir, int embed_dim, int use_bcsr) {
 
 
 
-
-
 /* ================= MAIN ================= */
 
-int main() {
+/* 
+Usage:
+    ./amx --mtx <dir>                       - process all .mtx files in target directory
+    ./amx --mtx <dir> --embed 128           - use embed dimension 128
+    ./amx --mtx <dir> --embed 128 --bcsr    - use BCSR format
+*/
+int main(int argc, char** argv) {
     printf("Intel AMX BF16 spMM\n");
     printf("====================\n");
-    printf("  sizeof(tilecfg_t)  = %zu  (must be 64)\n", sizeof(__tilecfg));
-    printf("  TILE_MAX_ROWS      = %d\n", TILE_MAX_ROWS);
-    printf("  TILE_MAX_FP32_COLS = %d\n", TILE_MAX_F32_COLS);
-    printf("  BCSR block         = %d x %d = %d BF16 elems (one full tile)\n\n", BCSR_BR, BCSR_BC, BCSR_BLOCK_ELEMS);
+    printf("sizeof(tilecfg_t)  = %zu  (must be 64)\n", sizeof(__tilecfg));
+    printf("TILE_MAX_ROWS      = %d\n", TILE_MAX_ROWS);
+    printf("TILE_MAX_FP32_COLS = %d\n", TILE_MAX_F32_COLS);
+    printf("BCSR block         = %d x %d = %d BF16 elems (one full tile)\n\n", BCSR_BR, BCSR_BC, BCSR_BLOCK_ELEMS);
 
-    if (amx_request_permission() != 0) {
+    if (request_amx_perm() != 1) {
         fprintf(stderr, "ERROR: Failed to enable AMX tile state.\n");
         return 1;
+    }
+
+    // CLI parsing
+    const char* mtx_dir = NULL;
+    int embed_dim = 64;
+    int use_bcsr = 0;
+
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--mtx") == 0 && i + 1 < argc) mtx_dir = argv[++i];
+        else if (strcmp(argv[i], "--embed") == 0 && i + 1 < argc) embed_dim = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--bcsr") == 0) use_bcsr = 1;
+        else {
+            fprintf(stderr, "Unknown arg: %s\n", argv[i]);
+            fprintf(stderr, "Usage: %s [--mtx <dir>] [--embed 64|128] [--bcsr]\n", argv[0]);
+            return 1;
+        }
+    }
+
+    if (mtx_dir) {
+        run_mtx_directory(mtx_dir, embed_dim, use_bcsr);
+        return 0;
     }
 }
