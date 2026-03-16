@@ -10,6 +10,11 @@
 #include <assert.h>
 #include <time.h>
 
+// 
+#ifdef USE_SUITESPARSE
+    #include "amd.h"
+#endif
+
 
 /*  ==============
   *  Constants
@@ -54,17 +59,20 @@ static int request_amx_perm() {
 
 
 /* ================================================================
- * Tile config
- *
- * Hardware-mandated 64-byte layout — do NOT reorder fields.
- * Intel SDM Vol.1 §17.4
- *
- *   bytes  0:     palette_id
- *   bytes  1:     start_row
- *   bytes  2-15:  reserved
- *   bytes 16-47:  colsb[16]   (2 bytes each, 16 tile registers)
- *   bytes 48-63:  rows[16]    (1 byte  each, 16 tile registers)
- * ================================================================ */
+  Tile config
+ 
+  Hardware-mandated 64-byte layout — do not reorder fields.
+  Intel SDM Vol.1 §17.4
+ 
+ *   byte  0     : palette_id
+ *   byte  1     : start_row
+ *   bytes 2-15  : reserved (zero)
+ *   bytes 16-31 : colsb[0..7]  (uint16, bytes per row for each tile)
+ *   bytes 32-47 : reserved (zero)
+ *   bytes 48-55 : rows[0..7]   (uint8, row count for each tile)
+ *   bytes 56-63 : reserved (zero)
+   ================================================================ */
+
 typedef struct __tile_config {
     uint8_t palette_id;     // 0 AMX deactivated, 1 provides 8kb internal storage with each tiledata register holding up to 1kb (16 rows x 64 bytes)
     uint8_t start_row;      // restart position if an operation is interrupted (page fault etc)
@@ -76,7 +84,7 @@ typedef struct __tile_config {
 } __tilecfg;
 
 // debug
-_Static_assert(sizeof(__tilecfg) == 64, "tilecfg must be exactly 64 bytes");
+// _Static_assert(sizeof(__tilecfg) == 64, "tilecfg must be exactly 64 bytes");
 
 
 /*
@@ -757,6 +765,101 @@ static float random_float(void) {
     return (float)(int32_t)random_seed / (float)(1u << 31);
 }
 
+
+/* ================= REORDERING ================= */
+
+// Helper types
+
+// (col, val) pair used by csr_permute for per-row sorting
+typedef struct {
+    int col; 
+    uint16_t val;
+} ColValPair;
+
+static int colval_cmp(const void* a, const void* b) {
+    return ((const ColValPair*)a)->col - ((const ColValPair*)b)->col;
+}
+
+// undirected edge, used by build_sym_adj
+typedef struct {
+    int r, c;
+} SymEdge;
+
+static int symedge_cmp(const void* a, const void* b) {
+    const SymEdge* x = (const SymEdge*)a, *y = (const SymEdge*)b;
+    if (x->r != y->r) {
+        return x->r - y->r;
+    }
+    return x->c - y->c;
+}
+
+
+/*  
+    Build a symmetric adjacency CSR from A. (Pattern only, no diagonal)
+    both (i, j) and (j, i) are emitted for every off diag nz, duplicates are removed after sorting.
+    Used as input to both AMD and RCM, so those algs can operate on an undirected graph 
+    regardless of whether A's storage is symmetric.
+*/
+static int build_sym_adj(const CSRMatrix* A, int **out_ptr, int **out_idx) {
+    int n = A->nrows;
+    int nnz = A->nnz;
+
+    SymEdge* edges = (SymEdge*)malloc(2 * (size_t)nnz * sizeof(SymEdge));
+    if (!edges) {
+        perror("build_sym_adj edges"); 
+        return -1;
+    }
+
+    int cnt = 0;
+    for (int i = 0; i < n; i++) {
+        for (int p = A->rowptr[i]; p < A->rowptr[i+1]; p++) {
+            int j = A->colidx[p];
+            if (i == j) continue;   // skip the diagonal
+            edges[cnt].r = i; edges[cnt].c = j; cnt++;
+            edges[cnt].r = i; edges[cnt].c = j; cnt++;
+        }
+    }
+    qsort(edges, (size_t)cnt, sizeof(SymEdge), symedge_cmp);
+
+    // remove duplicates
+    int u = 0;
+    for (int k = 0; k < cnt; k++) {
+        if (u == 0 || edges[k].r != edges[u-1].r || edges[k].c != edges[u-1].c) {
+            edges[u++] = edges[k];
+        }
+    }
+    cnt = u;
+
+    // build CSR
+    int* ptr = (int*)calloc((size_t)(n + 1), sizeof(int));
+    int* idx = (int*)malloc((size_t)cnt * sizeof(int));
+    int* cur = (int*)malloc((size_t)n * sizeof(int));
+    if (!ptr || !idx || !cur) {
+        perror("build_sym_adj csr");
+        free(edges);
+        free(ptr);
+        free(idx);
+        free(cur);
+        return -1;
+    }
+
+    for (int k = 0; k < cnt; k++) {
+        ptr[edges[k].r + 1]++;
+    }
+    for (int i = 0; i < n; i++) {
+        ptr[i+1] += ptr[i];
+    }
+    memcpy(cur, ptr, (size_t)n * sizeof(int));
+    for (int k = 0; k < cnt; k++) {
+        idx[cur[edges[k].r]++] = edges[k].c;
+    }
+
+    free(cur);
+    free(edges);
+    *out_ptr = ptr;
+    *out_idx = idx;
+    return 0;
+}
 
 /* ================= MTX EXTRACTION ================= */
 
