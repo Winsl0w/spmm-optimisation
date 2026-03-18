@@ -1218,6 +1218,272 @@ static int compute_amd_order(const CSRMatrix* A, int* perm) {
 #define CLUSTER_DEFAULT_THRESHOLD 0.3f
 #define CLUSTER_MAX_COL_DEGREE 500
 
+typedef struct {
+    int row;
+    int nnz;
+} RowNnz;
+
+// comparator for sorting row indices by decreasing nnz
+static int rownnz_cmp_desc(const void* a, const void* b) {
+    return ((const RowNnz*)b)->nnz - ((const RowNnz*)a)->nnz;
+}
+
+
+typedef struct {
+    int* members;
+    int size;
+    int min_row;
+} Cluster;
+
+// comparator for sorting clusters by minimum row index
+static int cluster_cmp(const void* a, const void* b) {
+    return ((const Cluster*)a)->min_row - ((const Cluster*)b)->min_row;
+}
+
+
+// fills perm[0..n-1] with a permutation that groups similar rows into consecutive bands of BCSR_BR rows
+static int compute_cluster_order(const CSRMatrix* A, int* perm,
+                                  float sim_threshold, int max_col_degree)
+{
+    int n   = A->nrows;
+    int m   = A->ncols;
+    int nnz = A->nnz;
+ 
+    if (n != m) {
+        fprintf(stderr, "Cluster reorder requires square matrix (%d x %d)\n", n, m);
+        return -1;
+    }
+ 
+    /* ── 1. Build column inverted index (CSC pattern) ── */
+    int* col_ptr = (int*)calloc((size_t)(m + 1), sizeof(int));
+    int* col_idx = (int*)malloc((size_t)nnz    * sizeof(int));
+    if (!col_ptr || !col_idx) {
+        perror("cluster: col index"); free(col_ptr); free(col_idx); return -1;
+    }
+ 
+    /* count */
+    for (int i = 0; i < n; i++)
+        for (int p = A->rowptr[i]; p < A->rowptr[i+1]; p++)
+            col_ptr[A->colidx[p] + 1]++;
+    /* prefix sum */
+    for (int j = 0; j < m; j++) col_ptr[j+1] += col_ptr[j];
+    /* fill */
+    int* col_cur = (int*)malloc((size_t)m * sizeof(int));
+    if (!col_cur) { perror("cluster: col_cur"); free(col_ptr); free(col_idx); return -1; }
+    memcpy(col_cur, col_ptr, (size_t)m * sizeof(int));
+    for (int i = 0; i < n; i++)
+        for (int p = A->rowptr[i]; p < A->rowptr[i+1]; p++)
+            col_idx[col_cur[A->colidx[p]]++] = i;
+    free(col_cur);
+ 
+    /* ── 2. Per-row nnz sizes ── */
+    int* row_size = (int*)malloc((size_t)n * sizeof(int));
+    if (!row_size) { perror("cluster: row_size"); free(col_ptr); free(col_idx); return -1; }
+    for (int i = 0; i < n; i++)
+        row_size[i] = A->rowptr[i+1] - A->rowptr[i];
+ 
+    /* ── 3. Process order: decreasing nnz ── */
+    RowNnz* order = (RowNnz*)malloc((size_t)n * sizeof(RowNnz));
+    if (!order) { perror("cluster: order"); free(col_ptr); free(col_idx); free(row_size); return -1; }
+    for (int i = 0; i < n; i++) { order[i].row = i; order[i].nnz = row_size[i]; }
+    qsort(order, (size_t)n, sizeof(RowNnz), rownnz_cmp_desc);
+ 
+    /* ── 4. Cluster assignment ──
+     * assigned[i] = 1 once row i has been placed into a cluster */
+    char* assigned = (char*)calloc((size_t)n, 1);
+    if (!assigned) {
+        perror("cluster: assigned");
+        free(col_ptr); free(col_idx); free(row_size); free(order); return -1;
+    }
+ 
+    /* intersection accumulator: isect[k] = number of shared columns seen so far */
+    int* isect = (int*)calloc((size_t)n, sizeof(int));
+    /* touched[]: list of rows whose isect[] entry was modified (for fast reset) */
+    int* touched  = (int*)malloc((size_t)n * sizeof(int));
+    /* cluster member buffer */
+    int* members  = (int*)malloc((size_t)BCSR_BR * sizeof(int));
+    if (!isect || !touched || !members) {
+        perror("cluster: work arrays");
+        free(col_ptr); free(col_idx); free(row_size); free(order);
+        free(assigned); free(isect); free(touched); free(members);
+        return -1;
+    }
+ 
+    /* Clusters stored as a flat array of Cluster structs.
+     * Upper bound: n clusters (all singletons). */
+    Cluster* clusters = (Cluster*)malloc((size_t)n * sizeof(Cluster));
+    if (!clusters) {
+        perror("cluster: clusters");
+        free(col_ptr); free(col_idx); free(row_size); free(order);
+        free(assigned); free(isect); free(touched); free(members); return -1;
+    }
+    int n_clusters = 0;
+ 
+    for (int oi = 0; oi < n; oi++) {
+        int seed = order[oi].row;
+        if (assigned[seed]) continue;
+ 
+        /* Start new cluster with seed */
+        int cl_size = 0;
+        members[cl_size++] = seed;
+        assigned[seed] = 1;
+ 
+        /* Merged column set: union of columns of all current cluster members.
+         * We reuse the isect accumulation pass for this. */
+ 
+        /* Grow cluster up to BCSR_BR */
+        while (cl_size < BCSR_BR) {
+            /* Accumulate intersection counts from all current cluster members */
+            int n_touched = 0;
+            for (int ci = 0; ci < cl_size; ci++) {
+                int row = members[ci];
+                for (int p = A->rowptr[row]; p < A->rowptr[row+1]; p++) {
+                    int j = A->colidx[p];
+                    /* skip hub columns */
+                    if (col_ptr[j+1] - col_ptr[j] > max_col_degree) continue;
+                    for (int q = col_ptr[j]; q < col_ptr[j+1]; q++) {
+                        int k = col_idx[q];
+                        if (assigned[k]) continue;
+                        if (isect[k] == 0) touched[n_touched++] = k;
+                        isect[k]++;
+                    }
+                }
+            }
+ 
+            /* Compute union size for current cluster (sum of row_sizes, minus
+             * duplicates already in the merged set — approximated as the
+             * intersection sum divided by a correction factor).
+             * For Jaccard we need |cluster_cols ∪ candidate_cols|.
+             * cluster_cols size = sum of row_size[members] - over-count from shared cols.
+             * We approximate cluster_union_size as the number of distinct columns
+             * touched, which we track via n_touched_unique below.
+             * Simpler and cheaper: use the pairwise Jaccard between the NEW candidate
+             * and the cluster centroid (virtual row = union of all member rows). */
+ 
+            /* cluster_col_count = distinct columns in the merged cluster so far.
+             * We recompute it cheaply: it equals the number of unique (row, col)
+             * pairs seen. Since isect[k] > 0 for any k that shares a col, the
+             * cluster union size equals the sum of all cluster member row_sizes
+             * minus the number of duplicate column hits within the cluster itself.
+             * For simplicity we track cluster_union_size explicitly. */
+            int cluster_union_sz = 0;
+            for (int ci = 0; ci < cl_size; ci++) cluster_union_sz += row_size[members[ci]];
+            /* subtract intra-cluster duplicates: columns shared by 2+ members
+             * were counted multiple times in isect. The exact count is expensive,
+             * so we use: cluster_union_sz ≈ n_touched_distinct (conservative). */
+            /* Actually n_touched is already the distinct column count contributed
+             * by all cluster members combined — it's the union size. */
+            /* Wait: n_touched counts distinct *candidate rows* not distinct cols.
+             * We need a separate distinct-col count. */
+            /* Recount distinct cluster columns via a second pass (only once per
+             * grow step, not per candidate): */
+            int distinct_cluster_cols = 0;
+            {
+                /* temporary: mark cluster columns */
+                char* col_mark = (char*)calloc((size_t)m, 1);
+                if (col_mark) {
+                    for (int ci = 0; ci < cl_size; ci++)
+                        for (int p = A->rowptr[members[ci]]; p < A->rowptr[members[ci]+1]; p++)
+                            col_mark[A->colidx[p]] = 1;
+                    for (int j = 0; j < m; j++) if (col_mark[j]) distinct_cluster_cols++;
+                    free(col_mark);
+                } else {
+                    /* OOM fallback: use sum of sizes as upper bound */
+                    distinct_cluster_cols = cluster_union_sz;
+                }
+            }
+ 
+            /* Find the best unassigned candidate by Jaccard */
+            int   best_k     = -1;
+            float best_jacc  = sim_threshold - 1e-9f;  /* must exceed threshold */
+ 
+            for (int ti = 0; ti < n_touched; ti++) {
+                int k = touched[ti];
+                int inter = isect[k];
+                int union_sz = distinct_cluster_cols + row_size[k] - inter;
+                if (union_sz <= 0) continue;
+                float jacc = (float)inter / (float)union_sz;
+                if (jacc > best_jacc) { best_jacc = jacc; best_k = k; }
+            }
+ 
+            /* Reset isect */
+            for (int ti = 0; ti < n_touched; ti++) isect[touched[ti]] = 0;
+ 
+            if (best_k < 0) {
+                /* No candidate exceeds similarity threshold.
+                 * Pad to BCSR_BR with the nearest unassigned rows by index,
+                 * scanning outward from the cluster's current min/max bounds. */
+                int cl_min = members[0], cl_max = members[0];
+                for (int ci = 1; ci < cl_size; ci++) {
+                    if (members[ci] < cl_min) cl_min = members[ci];
+                    if (members[ci] > cl_max) cl_max = members[ci];
+                }
+                int lo = cl_min - 1;  /* cursor scanning left  */
+                int hi = cl_max + 1;  /* cursor scanning right */
+                while (cl_size < BCSR_BR) {
+                    /* Advance cursors past already-assigned rows */
+                    while (lo >= 0 && assigned[lo]) lo--;
+                    while (hi < n  && assigned[hi]) hi++;
+                    int lo_dist = (lo >= 0) ? (cl_min - lo) : n + 1;
+                    int hi_dist = (hi <  n) ? (hi - cl_max) : n + 1;
+                    if (lo_dist > n && hi_dist > n) break; /* no unassigned rows left */
+                    int pick = (lo_dist <= hi_dist) ? lo : hi;
+                    members[cl_size++] = pick;
+                    assigned[pick] = 1;
+                    if (pick == lo) lo--; else hi++;
+                }
+                break;  /* done growing this cluster */
+            }
+ 
+            members[cl_size++] = best_k;
+            assigned[best_k]   = 1;
+        }
+ 
+        /* Store cluster */
+        int* cl_mem = (int*)malloc((size_t)cl_size * sizeof(int));
+        if (!cl_mem) {
+            /* OOM: fall back to placing remaining rows in order */
+            for (int i = 0; i < n; i++) if (!assigned[i]) { assigned[i] = 1; }
+            break;
+        }
+        /* Sort members by original row index for locality */
+        /* (insertion sort — cl_size ≤ BCSR_BR = 16) */
+        memcpy(cl_mem, members, (size_t)cl_size * sizeof(int));
+        for (int a = 1; a < cl_size; a++) {
+            int key = cl_mem[a], b = a - 1;
+            while (b >= 0 && cl_mem[b] > key) { cl_mem[b+1] = cl_mem[b]; b--; }
+            cl_mem[b+1] = key;
+        }
+        clusters[n_clusters].members = cl_mem;
+        clusters[n_clusters].size    = cl_size;
+        clusters[n_clusters].min_row = cl_mem[0];
+        n_clusters++;
+    }
+ 
+    free(isect); free(touched); free(members); free(assigned); free(order);
+    free(row_size); free(col_ptr); free(col_idx);
+ 
+    /* ── 5. Sort clusters by min_row for spatial locality ── */
+    qsort(clusters, (size_t)n_clusters, sizeof(Cluster), cluster_cmp);
+ 
+    /* ── 6. Emit permutation ── */
+    int pos = 0;
+    for (int ci = 0; ci < n_clusters; ci++) {
+        for (int k = 0; k < clusters[ci].size; k++)
+            perm[pos++] = clusters[ci].members[k];
+        free(clusters[ci].members);
+    }
+    free(clusters);
+ 
+    /* Sanity: pos should equal n */
+    if (pos != n) {
+        fprintf(stderr, "cluster: permutation incomplete (%d / %d rows placed)\n", pos, n);
+        return -1;
+    }
+ 
+    return 0;
+}
+
 // apply symmetrix permutation P x A x PT to square CSR matrix
 /*
     New row i collects entries of old row perm[i], with each column index
@@ -1295,7 +1561,7 @@ static DenseF32* dense_f32_unpermute_rows(const DenseF32* C_perm, const int* per
 /* ================= MTX EXTRACTION ================= */
 
 // run program on a single .mtx file
-static void run_mtx_file(const char* path, int embed_dim, int use_bcsr, ReorderMethod reorder) {
+static void run_mtx_file(const char* path, int embed_dim, int use_bcsr, ReorderMethod reorder, float cluster_thresh) {
     printf("\n────────────────────────────────────────────────────────\n");
     printf("  File : %s\n", path);
 
@@ -1326,10 +1592,17 @@ static void run_mtx_file(const char* path, int embed_dim, int use_bcsr, ReorderM
                 free(inv_perm);
                 perm = inv_perm = NULL;
             } else {
-                const char* method = (reorder == REORDER_AMD) ? "AMD" : "RCM";
+                const char* method = (reorder == REORDER_AMD) ? "AMD" : (reorder == REORDER_RCM) ? "RCM" : "Cluster";
                 printf("Reorder : computing %s permutation\n", method);
                 t0 = now_sec();
-                int ok = (reorder == REORDER_AMD) ? compute_amd_order(A_csr_orig, perm) : compute_rcm_order(A_csr_orig, perm);
+                int ok;
+                if (reorder == REORDER_AMD) {
+                    ok = compute_amd_order(A_csr_orig, perm);
+                } else if (reorder == REORDER_RCM) {
+                    ok = compute_rcm_order(A_csr_orig, perm);
+                } else {
+                    ok = compute_cluster_order(A_csr_orig, perm, cluster_thresh, CLUSTER_MAX_COL_DEGREE);
+                }
                 double t_order = now_sec() - t0;
 
                 if (ok != 0) {
@@ -1431,7 +1704,7 @@ static void run_mtx_file(const char* path, int embed_dim, int use_bcsr, ReorderM
 }
 
 // run program on all .mtx files in a directory
-static void run_mtx_directory(const char* dir, int embed_dim, int use_bcsr, ReorderMethod reorder) {
+static void run_mtx_directory(const char* dir, int embed_dim, int use_bcsr, ReorderMethod reorder, float cluster_thresh) {
     printf("\n========================================\n");
     printf("Source Directory : %s\n", dir);
     printf("embed_dim = %d,  format = %s\n",
@@ -1451,7 +1724,7 @@ static void run_mtx_directory(const char* dir, int embed_dim, int use_bcsr, Reor
         if (len < 4 || strcmp(ent->d_name + len - 4, ".mtx") != 0) continue;
         char fullpath[4096];
         snprintf(fullpath, sizeof(fullpath), "%s/%s", dir, ent->d_name);
-        run_mtx_file(fullpath, embed_dim, use_bcsr, reorder);
+        run_mtx_file(fullpath, embed_dim, use_bcsr, reorder, cluster_thresh);
         count++;
     }
     closedir(d);
@@ -1523,7 +1796,7 @@ int main(int argc, char** argv) {
     }
 
     if (mtx_dir) {
-        run_mtx_directory(mtx_dir, embed_dim, use_bcsr, reorder);
+        run_mtx_directory(mtx_dir, embed_dim, use_bcsr, reorder, cluster_thresh);
         return 0;
     }
 }
