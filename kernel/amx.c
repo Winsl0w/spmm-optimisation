@@ -35,7 +35,8 @@
 typedef enum {
     REORDER_NONE = 0,
     REORDER_AMD,
-    REORDER_RCM
+    REORDER_RCM,
+    REORDER_CLUSTER
 } ReorderMethod;
 
 
@@ -243,6 +244,7 @@ typedef struct {
 static BCSRMatrix* bcsr_alloc(int nrows, int ncols, int nblocks) {
     assert(nrows % BCSR_BR == 0 && ncols % BCSR_BC == 0);
     BCSRMatrix* m = (BCSRMatrix*)malloc(sizeof(BCSRMatrix));
+    if (!m) {perror("bcsr_alloc struct"); return NULL;}
     m->nrows = nrows;
     m->ncols = ncols;
     m->nblockrows = nrows / BCSR_BR;
@@ -250,10 +252,20 @@ static BCSRMatrix* bcsr_alloc(int nrows, int ncols, int nblocks) {
     m->nblocks = nblocks;
     m->blockrowptr = (int*)calloc(m->nblockrows + 1, sizeof(int));
     m->blockcolidx = (int*)malloc(nblocks * sizeof(int));
+    if (!m->blockcolidx || !m->blockrowptr) {
+        perror("bcsr_alloc index arrays");
+        free(m->blockrowptr);
+        free(m->blockcolidx);
+        free(m);
+        return NULL;
+    }
 
     if (posix_memalign((void **)&m->values, 64, (size_t)nblocks * BCSR_BLOCK_ELEMS * sizeof(uint16_t)) != 0) {
         perror("posix_memalign failure");
-        exit(-1);
+        free(m->blockrowptr);
+        free(m->blockcolidx);
+        free(m);
+        return NULL;
     }
     memset(m->values, 0, (size_t)nblocks * BCSR_BLOCK_ELEMS * sizeof(uint16_t));
     return m;
@@ -847,8 +859,7 @@ static BCSRMatrix *csr_to_bcsr(const CSRMatrix *csr)
                 else { lo = mid; break; }
             }
             // lo is now the index of block (br, bc) 
-            m->values[(size_t)lo * BCSR_BLOCK_ELEMS + lr * BCSR_BC + lc] =
-                csr->values[p];
+            m->values[(size_t)lo * BCSR_BLOCK_ELEMS + lr * BCSR_BC + lc] = csr->values[p];
         }
     }
     return m;
@@ -900,63 +911,139 @@ static int symedge_cmp(const void* a, const void* b) {
 */
 static int build_sym_adj(const CSRMatrix* A, int **out_ptr, int **out_idx) {
     int n = A->nrows;
-    int nnz = A->nnz;
 
-    SymEdge* edges = (SymEdge*)malloc(2 * (size_t)nnz * sizeof(SymEdge));
-    if (!edges) {
-        perror("build_sym_adj edges"); 
-        return -1;
-    }
+    // Pass 1, compute symmetric degree. For each off diag elt add both i->j and j->i
+    // use temp per node count to track reverse edges already in the original CSR
+    int* ptr = (int*)calloc((size_t)(n+1), sizeof(int));
+    if (!ptr) {perror("build_sym_adj ptr"); return -1;}
 
-    int cnt = 0;
+    // count forward edges skipping diag
     for (int i = 0; i < n; i++) {
         for (int p = A->rowptr[i]; p < A->rowptr[i+1]; p++) {
+            if (A->colidx[p] != i) ptr[i+1]++;
+        }
+    }
+
+    // count reverse edges not present
+    char* present = (char*)calloc((size_t)n, 1);
+    if (!present) {perror("build_sym_adj present"); free(ptr); return -1;}
+
+    for (int i = 0; i < n; i++) {
+        // mark all columns that appear in row i
+        for (int p = A->rowptr[i]; p < A->rowptr[i+1]; p++) {
+            present[A->colidx[p]] = 1;
+        }
+        // for each row j that has i as a column, add reverse if needed
+        for (int p = A->rowptr[i]; p < A->rowptr[i+1]; p++) {
             int j = A->colidx[p];
-            if (i == j) continue;   // skip the diagonal
-            edges[cnt].r = i; edges[cnt].c = j; cnt++;
-            edges[cnt].r = j; edges[cnt].c = i; cnt++;
+            if (j == i) continue;
+            if (!present[i]) ptr[j+1]++;
+        }
+        // unmark
+        for (int p = A->rowptr[i]; p < A->rowptr[i+1]; p++) {
+            present[A->colidx[p]] = 0;
         }
     }
-    qsort(edges, (size_t)cnt, sizeof(SymEdge), symedge_cmp);
 
-    // remove duplicates
-    int u = 0;
-    for (int k = 0; k < cnt; k++) {
-        if (u == 0 || edges[k].r != edges[u-1].r || edges[k].c != edges[u-1].c) {
-            edges[u++] = edges[k];
-        }
-    }
-    cnt = u;
+    free(present);
 
-    // build CSR
-    int* ptr = (int*)calloc((size_t)(n + 1), sizeof(int));
-    int* idx = (int*)malloc((size_t)cnt * sizeof(int));
+    // prefix sum to get row start offsets
+    for (int i = 0; i < n; i++) ptr[i+1] += ptr[i];
+    int total_edges = ptr[n];
+    
+    int* idx = (int*)malloc((size_t)total_edges * sizeof(int));
     int* cur = (int*)malloc((size_t)n * sizeof(int));
-    if (!ptr || !idx || !cur) {
-        perror("build_sym_adj csr");
-        free(edges);
+    if (!idx || !cur) {
+        perror("build_sym_adj idx");
         free(ptr);
         free(idx);
         free(cur);
         return -1;
     }
 
-    for (int k = 0; k < cnt; k++) {
-        ptr[edges[k].r + 1]++;
-    }
-    for (int i = 0; i < n; i++) {
-        ptr[i+1] += ptr[i];
-    }
     memcpy(cur, ptr, (size_t)n * sizeof(int));
-    for (int k = 0; k < cnt; k++) {
-        idx[cur[edges[k].r]++] = edges[k].c;
+
+    // pass 2: fill forward edges
+    for (int i = 0; i < n; i++) {
+        for (int p = A->rowptr[i]; p < A->rowptr[i+1]; p++) {
+            int j = A->colidx[p];
+            if (j != i) idx[cur[i]++] = j;
+        }
     }
 
+    // pass 2.1: fill reverse edges where missing
+    present = (char*)calloc((size_t)n, 1);
+    if (!present) {perror("build_sym_adj present2"); free(ptr); free(cur); free(idx); return -1;}
+
+    for (int i = 0; i < n; i++) {
+        for (int p = A->rowptr[i]; p < A->rowptr[i+1]; p++) present[A->colidx[p]] = 1;
+        for (int p = A->rowptr[i]; p < A->rowptr[i+1]; p++) {
+            int j = A->colidx[p];
+            if (j == i) continue;
+            if (!present[i]) idx[cur[j]++] = i; // add reverse j->i
+        }
+        for (int p = A->rowptr[i]; p < A->rowptr[i+1]; p++) present[A->colidx[p]] = 0;
+    }
+
+    free(present);
     free(cur);
-    free(edges);
     *out_ptr = ptr;
     *out_idx = idx;
     return 0;
+}
+
+
+// George Liu heuristic for finding a good RCM start node
+static int pseudo_peripheral_node(int start, const int* adj_ptr, const int* adj_idx, const int* degree, char* visited_scratch, int* queue, int n) {
+    // temp visited array local to BFS
+    int* level = (int*)calloc((size_t)n, sizeof(int));
+    if (!level) return start; // fallback on OOM (scary)
+
+    int cur = start;
+    int prev_depth = -1;
+
+    for (;;) {
+        // BFS from cur 
+        int qhead = 0, qtail = 0;
+        queue[qtail++] = cur;
+        level[cur] = 1;
+ 
+        int max_depth = 1;
+        while (qhead < qtail) {
+            int u = queue[qhead++];
+            int d = level[u] + 1;
+            if (d > max_depth) max_depth = d;
+            for (int p = adj_ptr[u]; p < adj_ptr[u+1]; p++) {
+                int v = adj_idx[p];
+                if (!visited_scratch[v] && !level[v]) {
+                    level[v] = d;
+                    queue[qtail++] = v;
+                }
+            }
+        }
+ 
+        if (max_depth <= prev_depth) {
+            // No improvement — reset level and return previous cur 
+            for (int i = 0; i < qtail; i++) level[queue[i]] = 0;
+            free(level);
+            return cur;
+        }
+        prev_depth = max_depth;
+ 
+        // Pick lowest-degree node in the last level 
+        int best = -1;
+        for (int i = 0; i < qtail; i++) {
+            int v = queue[i];
+            if (level[v] == max_depth)
+                if (best < 0 || degree[v] < degree[best]) best = v;
+        }
+ 
+        // Reset level markers 
+        for (int i = 0; i < qtail; i++) level[queue[i]] = 0;
+ 
+        if (best < 0 || best == cur) { free(level); return cur; }
+        cur = best;
+    }
 }
 
 // Reverse Cuthill McKee (RCM) reordering
@@ -980,7 +1067,8 @@ static int compute_rcm_order(const CSRMatrix* A, int* perm) {
     int* degree = (int*)malloc((size_t)n * sizeof(int));
     char* visited = (char*)calloc((size_t)n, 1);
     int* queue = (int*)malloc((size_t)n * sizeof(int));
-    int* nbuf = (int*)malloc((size_t)n * sizeof(int));
+    int* nbuf = (int*)malloc((size_t)n * sizeof(int)); // holds unvisited neighbours for counting sort
+    int max_deg = 0;    // for sorting bucket array
 
     if (!degree || !visited || !queue || !nbuf) {
         perror("RCM alloc");
@@ -995,20 +1083,34 @@ static int compute_rcm_order(const CSRMatrix* A, int* perm) {
 
     for (int i = 0; i < n; i++) {
         degree[i] = adj_ptr[i+1] - adj_ptr[i];
+        if (degree[i] > max_deg) max_deg = degree[i];
     }
 
-    int total = 0;      // nodes placed into perm[] so far
-    int search = 0;     // cursor for finding start of the next component
+    // counting sort bucket, indexed by degree value
+    int* bucket = (int*)calloc((size_t)(max_deg + 2), sizeof(int));
+    int* sorted_nb = (int*)malloc((size_t)n * sizeof(int));
+    if (!bucket || !sorted_nb) {
+        perror("RCM bucket alloc");
+        free(adj_ptr); 
+        free(adj_idx);
+        free(degree); 
+        free(visited);
+        free(queue); 
+        free(nbuf); 
+        free(bucket); 
+        free(sorted_nb);
+        return -1;
+    }
 
+
+    int total = 0;      // nodes placed into perm[] so far
+    int search = 0;     // cursor for finding next unvisited node
     while (total < n) {
         // advance past already visited nodes
         while (search < n && visited[search]) search++;
         if (search == n) break;
 
-        int s = search;
-        for (int i = search + 1; i < n; i++) {
-            if (!visited[i] && degree[i] < degree[s]) s = i;
-        }
+        int s = pseudo_peripheral_node(search, adj_ptr, adj_idx, degree, visited, queue, n);
 
         int qhead = 0, qtail = 0;
         visited[s] = 1;
@@ -1028,18 +1130,24 @@ static int compute_rcm_order(const CSRMatrix* A, int* perm) {
                 }    
             }
 
-            // insertion sort by degree ascending (not ideal, but average degree is small)
-            for (int a = 1; a < nn; a++) {
-                int key = nbuf[a], dk = degree[key], b = a - 1;
-                while (b >= 0 && degree[nbuf[b]] > dk) {
-                    nbuf[b+1] = nbuf[b];
-                    b--;
-                }
-                nbuf[b+1] = key;
-            }
-            for (int a = 0; a < nn; a++) {
-                queue[qtail++] = nbuf[a];
-            }
+            if (nn == 0) continue;
+
+            // counting sort nbuf by degree ascending
+            //track local degree range
+            int local_max_deg = 0;
+            for (int a = 0; a < nn; a++) if (degree[nbuf[a]] > local_max_deg) local_max_deg = degree[nbuf[a]];
+
+
+            // count
+            for (int a = 0; a < nn; a++) bucket[degree[nbuf[a]]]++;
+            // prefix sum
+            for (int d = 1; d <= local_max_deg + 1; d++) bucket[d] += bucket[d-1];
+            // place in reverse for stability
+            for (int a = nn - 1; a >= 0; a--) sorted_nb[--bucket[degree[nbuf[a]]]] = nbuf[a];
+            // reset buckets 
+            memset(bucket, 0, (local_max_deg + 1) * sizeof(int));
+
+            for (int a = 0; a < nn; a++) queue[qtail++] = sorted_nb[a];
         }
     }
 
@@ -1056,6 +1164,8 @@ static int compute_rcm_order(const CSRMatrix* A, int* perm) {
     free(visited);
     free(queue);
     free(nbuf);
+    free(bucket);
+    free(sorted_nb);
     return 0;
 }
 
@@ -1100,6 +1210,13 @@ static int compute_amd_order(const CSRMatrix* A, int* perm) {
     return 0;
 #endif    
 }
+
+
+// Hierarchical clustering
+
+// default tuning params, overridable via compute_cluster_order() args
+#define CLUSTER_DEFAULT_THRESHOLD 0.3f
+#define CLUSTER_MAX_COL_DEGREE 500
 
 // apply symmetrix permutation P x A x PT to square CSR matrix
 /*
@@ -1240,6 +1357,14 @@ static void run_mtx_file(const char* path, int embed_dim, int use_bcsr, ReorderM
     if (use_bcsr) {
         t0 = now_sec();
         A_bcsr = csr_to_bcsr(A_csr);
+        if (!A_bcsr) {
+            fprintf(stderr, " csr_to_bcsr failed (out of memory?) - skipping %s\n", path);
+            csr_free(A_csr_orig);
+            if (A_csr_perm) csr_free(A_csr_perm);
+            free(perm);
+            free(inv_perm);
+            return;
+        }
         printf("CSR to BCSR : %.3f s (%d blocks, padded %dx%d to %dx%d)\n", now_sec() - t0, A_bcsr->nblocks, nrows, ncols, A_bcsr->nrows, A_bcsr->ncols);
         B_rows_amx = A_bcsr->ncols; // padded N must match kernel A.ncols
         C_rows_amx = A_bcsr->nrows; // padded M must match kernel A.nrows
@@ -1356,11 +1481,12 @@ int main(int argc, char** argv) {
     printf("BCSR block         = %d x %d = %d BF16 elems (one full tile)\n\n", BCSR_BR, BCSR_BC, BCSR_BLOCK_ELEMS);
 
 #ifdef USE_AMD
-    printf("SuiteSparse available\n");
+    printf("AMD available (--reorder amd)\n");
 #else
     printf("SuiteSparse not compiled in, rebuild with -DUSE_AMD\n");
 #endif
-    printf("RCM available by default\n\n");
+    printf("RCM available by default (--reorder rcm)\n");
+    printf("Hierarchical Clustering available (--reorder cluster)\n\n");
 
     if (request_amx_perm() != 1) {
         fprintf(stderr, "ERROR: Failed to enable AMX tile state.\n");
@@ -1372,23 +1498,26 @@ int main(int argc, char** argv) {
     int embed_dim = 64;
     int use_bcsr = 0;
     ReorderMethod reorder = REORDER_NONE;
+    float cluster_thresh = CLUSTER_DEFAULT_THRESHOLD;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--mtx") == 0 && i + 1 < argc) mtx_dir = argv[++i];
         else if (strcmp(argv[i], "--embed") == 0 && i + 1 < argc) embed_dim = atoi(argv[++i]);
         else if (strcmp(argv[i], "--bcsr") == 0) use_bcsr = 1;
+        else if (strcmp(argv[i], "--cluster-thresh") == 0 && i + 1 < argc) cluster_thresh = (float)atof(argv[++i]);
         else if (strcmp(argv[i], "--reorder") == 0 && i+1 < argc) {
             const char* m = argv[++i];
             if (strcmp(m, "amd") == 0) reorder = REORDER_AMD;
             else if (strcmp(m, "rcm") == 0) reorder = REORDER_RCM;
+            else if (strcmp(m, "cluster") == 0) reorder = REORDER_CLUSTER;
             else {
-                fprintf(stderr, "Unknown reorder method\n");
+                fprintf(stderr, "Unknown reorder method '%s', (choices: amd, rcm, cluster)\n", m);
                 return 1;
             }
         }
         else {
             fprintf(stderr, "Unknown arg: %s\n", argv[i]);
-            fprintf(stderr, "Usage: %s [--mtx <dir>] [--embed 64|128] [--bcsr] [--reorder amd|rcm]\n", argv[0]);
+            fprintf(stderr, "Usage: %s [--mtx <dir>] [--embed 64|128] [--bcsr] [--reorder amd|rcm|cluster] [--cluster-thresh <thresh>]\n", argv[0]);
             return 1;
         }
     }
