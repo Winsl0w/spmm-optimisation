@@ -10,10 +10,6 @@
 #include <assert.h>
 #include <time.h>
 
-// 
-#ifdef USE_SUITESPARSE
-    #include "amd.h"
-#endif
 
 
 /*  ==============
@@ -30,6 +26,18 @@
 #define TILE_MAX_F32_COLS 16   // 64 bytes / 4
 
 #define K_TILE 32           // num BF16 cols in A tile = num K elts processed per TDPBF16PS
+
+// Conditional compilation to include the headers from SuiteSparse
+#ifdef USE_AMD
+    #include "amd.h"
+#endif
+
+typedef enum {
+    REORDER_NONE = 0,
+    REORDER_AMD,
+    REORDER_RCM
+} ReorderMethod;
+
 
 /* ================= AMX PERMISSION ================= */
 
@@ -198,7 +206,7 @@ static CSRMatrix* csr_from_dense(const float* A, int nrows, int ncols) {
     }
     CSRMatrix* m = csr_alloc(nrows, ncols, nnz);
     int idx = 0;
-    for (int r = 0; r , nrows; r++) {
+    for (int r = 0; r < nrows; r++) {
         m->rowptr[r] = idx;
         for (int c = 0; c < ncols; c++) {
             if (A[r*ncols+c] != 0) {
@@ -299,7 +307,7 @@ static inline uint16_t dense_bf16_get(const DenseBF16* m, int r, int c) {
 }
 
 static inline void dense_bf16_set(DenseBF16* m, int r, int c, uint16_t v) {
-    m->data[r * m->stride + c];
+    m->data[r * m->stride + c] = v;
 }
 
 
@@ -377,21 +385,41 @@ static void amx_spmm_csr(const CSRMatrix* A, const DenseBF16* B, DenseF32* C) {
         memset(&C->data[r * C->stride], 0, C->cols * sizeof(float));
     }
 
+    int n_kstrips = (A->ncols + K_TILE - 1) / K_TILE;
+    char *kstrip_used = (char *)calloc((size_t)n_kstrips, 1);
+    if (!kstrip_used) { perror("amx_spmm_csr kstrip_used"); return; }
+ 
     for (int m0 = 0; m0 < M; m0 += TILE_MAX_ROWS) {
         int m_tile = (m0 + TILE_MAX_ROWS <= M) ? TILE_MAX_ROWS : M - m0;
 
+        int n_used = 0;
+
+        for (int ii = 0; ii < m_tile; ii++) {
+            int row = m0 + ii;
+            for (int p = A->rowptr[row]; p < A->rowptr[row+1]; p++) {
+                int ks = A->colidx[p] / K_TILE;
+                if (!kstrip_used[ks]) {kstrip_used[ks] = 1; n_used++;}
+            }
+        }
+
+        if (n_used == 0) {
+            continue;   // entire M tile is zero, C already zeroed
+        }
+
         for (int n0 = 0; n0 < N; n0 += TILE_MAX_F32_COLS) {
             int n_tile_f32 = (n0 + TILE_MAX_F32_COLS <= N) ? TILE_MAX_F32_COLS : N - n0;
-            
-            configure_amx_tiles_bf16(m_tile, n_tile_f32, K_TILE);
 
             // zero and load C tile
             memset(global_c_buf, 0, sizeof(global_c_buf));
+            configure_amx_tiles_bf16(m_tile, n_tile_f32, K_TILE);
             _tile_loadd(TILE_C, global_c_buf, TILE_MAX_F32_COLS * (int)sizeof(float));
 
-            for (int k0 = 0; k0 < K; k0 += K_TILE) {
-                int k_strip = (k0 + K_TILE <= K) ? K_TILE : K - k0;
-                int k_strip_padded = (k_strip + 1) & ~1; // round up to even for pairing
+            for (int ks = 0; ks <n_kstrips; ks++) {
+                if (!kstrip_used[ks]) continue;
+
+                int k0 = ks * K_TILE;
+                int k_strip = (k0 + K_TILE <= K) ? K_TILE : A->ncols - k0;
+                int k_padded = (k_strip + 1) & ~1;
 
                 // build A: scatter nnzs from this k strip
                 memset(global_a_buf, 0, sizeof(global_a_buf));
@@ -404,10 +432,10 @@ static void amx_spmm_csr(const CSRMatrix* A, const DenseBF16* B, DenseF32* C) {
                     }
                 }
 
-                pack_b_tile(B, k0, k_strip_padded, n0, n_tile_f32);
+                pack_b_tile(B, k0, k_padded, n0, n_tile_f32);
 
                 // update tile config for actual k_strip_padded as it could differ from K_TILE on the final strip
-                configure_amx_tiles_bf16(m_tile, n_tile_f32, k_strip_padded);
+                configure_amx_tiles_bf16(m_tile, n_tile_f32, k_padded);
                 _tile_loadd(TILE_C, global_c_buf, TILE_MAX_F32_COLS * (int)sizeof(float));
                 _tile_loadd(TILE_A, global_a_buf, K_TILE * (int)sizeof(uint16_t));
                 _tile_loadd(TILE_B, global_b_buf, n_tile_f32 * 2 * (int)sizeof(uint16_t));
@@ -426,7 +454,14 @@ static void amx_spmm_csr(const CSRMatrix* A, const DenseBF16* B, DenseF32* C) {
                 }
             }
         }
+        for (int ii = 0; ii < m_tile; ii++) {
+            int row = m0 + ii;
+            for (int p = A->rowptr[row]; p < A->rowptr[row + 1]; p++) {
+                kstrip_used[A->colidx[p] / K_TILE] = 0;
+            }
+        }
     }
+    free(kstrip_used);
     _tile_release();
 }
 
@@ -583,11 +618,63 @@ static CSRMatrix* mtx_read_to_csr(const char* path, int* nrows_out, int* ncols_o
     FILE *f = fopen(path, "r");
     if (!f) { perror(path); return NULL; }
 
-    // Parse banner
+    char raw_banner[MM_MAX_LINE_LENGTH];
+    if (!fgets(raw_banner, sizeof(raw_banner), f)) {
+        fprintf(stderr, "%s: empty file\n", path);
+        fclose(f);
+        return NULL;
+    }
+
+    static const struct {
+        const char* from;
+        const char* to;
+    } subs[] = {
+        {"unsymmetric", "general"},
+        {"lower-triangular", "general"},
+        {"upper-triangular", "general"},
+        {"lower_triangular", "general"},
+        {"upper_triangular", "general"},
+        {"binary", "pattern"},
+    };
+
+    char norm[MM_MAX_LINE_LENGTH];
+    strncpy(norm, raw_banner, sizeof(norm) - 1);
+    norm[sizeof(norm) - 1] = '\0';
+    for (char* p = norm; *p; p++) *p = (char)tolower((unsigned char)*p);
+
+    const char* banner_to_parse = raw_banner;
+    char fixed_banner[MM_MAX_LINE_LENGTH];
+
+    for (int s = 0; s < (int)(sizeof(subs)/sizeof(subs[0])); s++) {
+        char* hit = strstr(norm, subs[s].from);
+        if (hit) {
+            size_t prefix = (size_t)(hit - norm);
+            size_t from_len = strlen(subs[s].from);
+            size_t to_len = strlen(subs[s].to);
+            if (prefix + to_len + strlen(norm + prefix + from_len) + 1 < sizeof(fixed_banner)) {
+                memcpy(fixed_banner, raw_banner, prefix);
+                memcpy(fixed_banner + prefix, subs[s].to, to_len);
+                strcpy(fixed_banner + prefix + to_len, raw_banner + prefix + from_len);
+                banner_to_parse = fixed_banner;
+            }
+            break;
+        }
+    }
+
+
+    // Feed possibly normalised baner line to mm_read_banner via fmemopen so MMIO reads from the memory rather than the file
     MM_typecode matcode;
-    int ret = mm_read_banner(f, &matcode);
+    FILE* bmem = fmemopen((void*)banner_to_parse, strlen(banner_to_parse), "r");
+    if (!bmem) {
+        fprintf(stderr, "%s: fmemopen failed\n", path);
+        fclose(f);
+        return NULL;
+    }
+    int ret = mm_read_banner(bmem, &matcode);
+    fclose(bmem);
+
     if (ret != 0) {
-        fprintf(stderr, "%s: mm_read_banner failed (code %d)\n", path, ret);
+        fprintf(stderr, "%s: mm_read_banner failed (code %d)\n - banner: %s", path, ret, raw_banner);
         fclose(f); return NULL;
     }
 
@@ -604,7 +691,8 @@ static CSRMatrix* mtx_read_to_csr(const char* path, int* nrows_out, int* ncols_o
         fclose(f); return NULL;
     }
 
-    int is_pattern   = mm_is_pattern(matcode);
+    int is_pattern = mm_is_pattern(matcode);
+    int is_integer = mm_is_integer(matcode); // read integers like real
     int is_symmetric = mm_is_symmetric(matcode) || mm_is_skew(matcode) || mm_is_hermitian(matcode);
 
     // read dimensions
@@ -623,15 +711,25 @@ static CSRMatrix* mtx_read_to_csr(const char* path, int* nrows_out, int* ncols_o
     // read the entries
     long n = 0;
     for (int e = 0; e < nnz_file; e++) {
-        int    row, col;
+        int row, col;
         double real_val = 0.0, imag_val = 0.0;
-        ret = mm_read_mtx_crd_entry(f, &row, &col, &real_val, &imag_val,
-                                    matcode);
-        if (ret != 0) {
-            fprintf(stderr, "%s: read error at entry %d (code %d)\n",
-                    path, e, ret);
-            break;
+
+        if (is_integer) {
+            long iv = 0;
+            if (fscanf(f, "%d %d %ld", &row, &col, &iv) != 3) {
+                fprintf(stderr, "%s: read error at integer entry %d\n", path, e);
+                break;
+            }
+            real_val = (double)iv;
+        } else {
+            ret = mm_read_mtx_crd_entry(f, &row, &col, &real_val, &imag_val, matcode);
+            if (ret != 0) {
+                fprintf(stderr, "%s: read error at entry %d (code %d)\n",
+                        path, e, ret);
+                break;
+            }
         }
+
         // mmio uses 1 indexing
         row--; col--;
         if (row < 0 || row >= nrows || col < 0 || col >= ncols) continue;
@@ -663,14 +761,14 @@ static CSRMatrix* mtx_read_to_csr(const char* path, int* nrows_out, int* ncols_o
             coo[nnz++] = coo[i];
     }
 
-    CSRMatrix *m = csr_alloc(nrows, ncols, (int)nnz);
+    CSRMatrix* m = csr_alloc(nrows, ncols, (int)nnz);
 
     for (long i = 0; i < nnz; i++)
         m->rowptr[coo[i].row + 1]++;
     for (int r = 0; r < nrows; r++)
         m->rowptr[r+1] += m->rowptr[r];
 
-    int *cursor = (int *)malloc((size_t)nrows * sizeof(int));
+    int* cursor = (int *)malloc((size_t)nrows * sizeof(int));
     memcpy(cursor, m->rowptr, (size_t)nrows * sizeof(int));
     for (long i = 0; i < nnz; i++) {
         int pos = cursor[coo[i].row]++;
@@ -816,7 +914,7 @@ static int build_sym_adj(const CSRMatrix* A, int **out_ptr, int **out_idx) {
             int j = A->colidx[p];
             if (i == j) continue;   // skip the diagonal
             edges[cnt].r = i; edges[cnt].c = j; cnt++;
-            edges[cnt].r = i; edges[cnt].c = j; cnt++;
+            edges[cnt].r = j; edges[cnt].c = i; cnt++;
         }
     }
     qsort(edges, (size_t)cnt, sizeof(SymEdge), symedge_cmp);
@@ -861,64 +959,354 @@ static int build_sym_adj(const CSRMatrix* A, int **out_ptr, int **out_idx) {
     return 0;
 }
 
+// Reverse Cuthill McKee (RCM) reordering
+/* 
+    For each connected component, choose unvisited node with lowest degree as starting node.
+    When expanding a node, collect its unvisited neighbours, sort them by degree, then enqueue in that order (standard CM).
+    Reverse the full BFS order to get the RCM.
+
+    Produces perm[new_pos] = old_node
+*/
+static int compute_rcm_order(const CSRMatrix* A, int* perm) {
+    int n = A->nrows;
+    if (n != A->ncols) {
+        fprintf(stderr, "RCM requires square matrix (%d x %d)\n", n, A->ncols);
+        return -1;
+    }
+
+    int *adj_ptr = NULL, *adj_idx = NULL;
+    if (build_sym_adj(A, &adj_ptr, &adj_idx) != 0) return -1;
+
+    int* degree = (int*)malloc((size_t)n * sizeof(int));
+    char* visited = (char*)calloc((size_t)n, 1);
+    int* queue = (int*)malloc((size_t)n * sizeof(int));
+    int* nbuf = (int*)malloc((size_t)n * sizeof(int));
+
+    if (!degree || !visited || !queue || !nbuf) {
+        perror("RCM alloc");
+        free(adj_ptr);
+        free(adj_idx);
+        free(degree);
+        free(visited);
+        free(queue);
+        free(nbuf);
+        return -1;
+    }
+
+    for (int i = 0; i < n; i++) {
+        degree[i] = adj_ptr[i+1] - adj_ptr[i];
+    }
+
+    int total = 0;      // nodes placed into perm[] so far
+    int search = 0;     // cursor for finding start of the next component
+
+    while (total < n) {
+        // advance past already visited nodes
+        while (search < n && visited[search]) search++;
+        if (search == n) break;
+
+        int s = search;
+        for (int i = search + 1; i < n; i++) {
+            if (!visited[i] && degree[i] < degree[s]) s = i;
+        }
+
+        int qhead = 0, qtail = 0;
+        visited[s] = 1;
+        queue[qtail++] = s;
+
+        while (qhead < qtail) {
+            int u = queue[qhead++];
+            perm[total++] = u;
+
+            // collect neighbours
+            int nn = 0;
+            for (int p = adj_ptr[u]; p < adj_ptr[u+1]; p++) {
+                int v = adj_idx[p];
+                if (!visited[v]) {
+                    visited[v] = 1;
+                    nbuf[nn++] = v;
+                }    
+            }
+
+            // insertion sort by degree ascending (not ideal, but average degree is small)
+            for (int a = 1; a < nn; a++) {
+                int key = nbuf[a], dk = degree[key], b = a - 1;
+                while (b >= 0 && degree[nbuf[b]] > dk) {
+                    nbuf[b+1] = nbuf[b];
+                    b--;
+                }
+                nbuf[b+1] = key;
+            }
+            for (int a = 0; a < nn; a++) {
+                queue[qtail++] = nbuf[a];
+            }
+        }
+    }
+
+    // CM to RCM
+    for (int i = 0; i < n / 2; i++) {
+        int t = perm[i]; 
+        perm[i] = perm[n-1-i];
+        perm[n-1-i] = t;
+    }
+
+    free(adj_ptr);
+    free(adj_idx);
+    free(degree);
+    free(visited);
+    free(queue);
+    free(nbuf);
+    return 0;
+}
+
+
+// Approximate Minimum Degree (AMD) reordering
+/* 
+    Utilises SuiteSparse library
+    AMD minimises fill-in during factorisation, which generally clusters nzs near the diagonal
+
+    Needs to be compiled in. Returns -1 if not
+*/
+static int compute_amd_order(const CSRMatrix* A, int* perm) {
+#ifndef USE_AMD
+    (void)A; (void)perm;
+    fprintf(stderr,
+        "AMD not compiled in. \n"
+        "Rebuild with SuiteSparse using -DUSE_AMD -I/<path to SuiteSparse headers>"
+        " -lsuitesparseconfig\n");
+    return -1;
+#else
+    int n = A->nrows;
+    if (n != A->ncols) {
+        fprintf(stderr, "AMD requires square matrix (%d x %d)\n", n, A->ncols);
+        return -1;
+    }
+
+    int *Ap = NULL; 
+    int *Ai = NULL;
+    if (build_sym_adj(A, &Ap, &Ai) != 0) return -1;
+
+    double Control[AMD_CONTROL], Info[AMD_INFO];
+    amd_defaults(Control);
+
+    int status = amd_order(n, Ap, Ai, perm, Control, Info);
+    free(Ap);
+    free(Ai);
+
+    if (status != AMD_OK && status != AMD_OK_BUT_JUMBLED) {
+        fprintf(stderr, "amd_order returned status %d\n", status);
+        return -1;
+    }
+    return 0;
+#endif    
+}
+
+// apply symmetrix permutation P x A x PT to square CSR matrix
+/*
+    New row i collects entries of old row perm[i], with each column index
+    c remapped to inv_perm[c]. Each new row is sorted by column index.
+
+    Returns new CSRMatrix.
+*/
+static CSRMatrix* csr_permute(const CSRMatrix* A, const int* perm, const int* inv_perm) {
+    int n = A->nrows;
+    assert(n == A->ncols);
+
+    // largest row length, used to size the sort buffer
+    int max_row = 0;
+    for (int i = 0; i < n; i++) {
+        int len = A->rowptr[i+1] - A->rowptr[i];
+        if (len > max_row) max_row = len;
+    }
+    ColValPair* temp = (ColValPair*)malloc((size_t)(max_row > 0 ? max_row : 1) * sizeof(ColValPair));
+    if (!temp) {
+        perror("csr_permute");
+        return NULL;
+    }
+
+    CSRMatrix* B = csr_alloc(n, n, A->nnz);
+
+    // row pointer
+    B->rowptr[0] = 0;
+    for (int i = 0; i < n; i++) {
+        B->rowptr[i+1] = B->rowptr[i] + (A->rowptr[perm[i] + 1] - A->rowptr[perm[i]]);
+    }
+
+    // fill entries- remap the cols and sort each row
+    for (int i = 0; i < n; i++) {
+        int old = perm[i];
+        int len = A->rowptr[old+1] - A->rowptr[old];
+        int base = A->rowptr[old];
+        int dst = B->rowptr[i];
+
+        for (int k = 0; k < len; k++) {
+            temp[k].col = inv_perm[A->colidx[base + k]];
+            temp[k].val = A->values[base + k];
+        }
+        if (len > 1) qsort(temp, (size_t)len, sizeof(ColValPair), colval_cmp);
+        for (int k = 0; k < len; k++) {
+            B->colidx[dst + k] = temp[k].col;
+            B->values[dst + k] = temp[k].val;
+        }
+    }
+
+    free(temp);
+    return B;
+}
+
+
+// Create permuted copy of B
+static DenseBF16* dense_bf16_permute_rows(const DenseBF16* B, const int* perm, int n_perm, int n_total) {
+    DenseBF16* NB = dense_bf16_alloc(n_total, B->cols);
+    for (int i = 0; i < n_perm; i++) {
+        memcpy(NB->data + (size_t)i * NB->stride, B->data + (size_t)perm[i] * B->stride, (size_t)B->cols * sizeof(uint16_t));
+    }
+    return NB;
+}
+
+
+// unpermute the rows of output matrix C back to original ordering
+static DenseF32* dense_f32_unpermute_rows(const DenseF32* C_perm, const int* perm, int n_perm, int n_total) {
+    DenseF32* C = dense_f32_alloc(n_total, C_perm->cols);
+    for (int i = 0; i < n_perm; i++) {
+        memcpy(C->data + (size_t)perm[i] * C->stride, C_perm->data + (size_t)i * C_perm->stride, (size_t)C_perm->cols * sizeof(float));
+    }
+    return C;
+}
+
+
 /* ================= MTX EXTRACTION ================= */
 
 // run program on a single .mtx file
-static void run_mtx_file(const char* path, int embed_dim, int use_bcsr) {
+static void run_mtx_file(const char* path, int embed_dim, int use_bcsr, ReorderMethod reorder) {
     printf("\n────────────────────────────────────────────────────────\n");
     printf("  File : %s\n", path);
 
     // load mtx to CSR
     int nrows, ncols;
     double t0 = now_sec();
-    CSRMatrix* A_csr = mtx_read_to_csr(path, &nrows, &ncols);
+    CSRMatrix* A_csr_orig = mtx_read_to_csr(path, &nrows, &ncols);
+    if (!A_csr_orig) return;
     double t_load = now_sec() - t0;
-    if (!A_csr) return;
+
+    double sparsity = 1.0 - (double)A_csr_orig->nnz / ((double)nrows * ncols);
+    printf("A : %d x %d, nnz = %d, sparsity = %.2f%%\n", nrows, ncols, A_csr_orig->nnz, sparsity * 100);
     printf("Load : %.3f s\n", t_load);
+
+    // reordering
+    int* perm = NULL, *inv_perm = NULL;
+    CSRMatrix* A_csr_perm = NULL;
+
+    if (reorder != REORDER_NONE) {
+        if (nrows != ncols) {
+            printf(" [reorder] skipped, matrix is not square (%d x %d)\n", nrows, ncols);
+        } else {
+            perm = (int*)malloc((size_t)nrows * sizeof(int));
+            inv_perm = (int*)malloc((size_t)nrows * sizeof(int));
+            if (!perm || !inv_perm) {
+                perror("malloc perm");
+                free(perm);
+                free(inv_perm);
+                perm = inv_perm = NULL;
+            } else {
+                const char* method = (reorder == REORDER_AMD) ? "AMD" : "RCM";
+                printf("Reorder : computing %s permutation\n", method);
+                t0 = now_sec();
+                int ok = (reorder == REORDER_AMD) ? compute_amd_order(A_csr_orig, perm) : compute_rcm_order(A_csr_orig, perm);
+                double t_order = now_sec() - t0;
+
+                if (ok != 0) {
+                    printf(" [reorder] %s failed, continuining without reorder\n", method);
+                    free(perm);
+                    free(inv_perm);
+                    perm = inv_perm = NULL;
+                } else {
+                    for (int i = 0; i < nrows; i++) inv_perm[perm[i]] = i;
+                    printf("Reorder : %.3f s (%s)\n", t_order, method);
+                    t0 = now_sec();
+                    A_csr_perm = csr_permute(A_csr_orig, perm, inv_perm);
+                    printf("Permute : %.3f s \n", now_sec() - t0);
+                }
+            }
+        }
+    }
+
+    // A_csr used for AMX path, permuted if available, else original
+    CSRMatrix* A_csr = (A_csr_perm != NULL) ? A_csr_perm : A_csr_orig;
 
     // convert to BCSR 
     BCSRMatrix* A_bcsr = NULL;
-    int B_rows, C_rows;     // effective dimensions, as the dimensions could be padded in bcsr
+    int B_rows_amx, C_rows_amx;     // effective dimensions, as the dimensions could be padded in bcsr
     if (use_bcsr) {
         t0 = now_sec();
         A_bcsr = csr_to_bcsr(A_csr);
         printf("CSR to BCSR : %.3f s (%d blocks, padded %dx%d to %dx%d)\n", now_sec() - t0, A_bcsr->nblocks, nrows, ncols, A_bcsr->nrows, A_bcsr->ncols);
-        B_rows = A_bcsr->ncols; // padded N must match kernel A.ncols
-        C_rows = A_bcsr->nrows; // padded M must match kernel A.nrows
+        B_rows_amx = A_bcsr->ncols; // padded N must match kernel A.ncols
+        C_rows_amx = A_bcsr->nrows; // padded M must match kernel A.nrows
     } else {
-        B_rows = ncols;
-        C_rows = nrows;
+        B_rows_amx = ncols;
+        C_rows_amx = nrows;
     }
-    printf("B : %d x %d  (N x embed_dim)\n", B_rows, embed_dim);
-    printf("C : %d x %d  (M x embed_dim)\n", C_rows, embed_dim);
+    printf("B : %d x %d  (N x embed_dim)\n", B_rows_amx, embed_dim);
+    printf("C : %d x %d  (M x embed_dim)\n", C_rows_amx, embed_dim);
 
+    // allocate B
     random_seed = 0xABCD1234u;
-    DenseBF16* B = dense_bf16_alloc(B_rows, embed_dim);
-    for (int r = 0; r < ncols; r++) {
-        for (int c = 0; c < embed_dim; c++) {
-            dense_bf16_set(B, r, c, float_to_bf16(random_float() * 2.0f - 1.0f));
+
+    DenseBF16* B_orig = NULL;
+    DenseBF16* B_amx;
+
+    if (perm != NULL) {
+        B_orig = dense_bf16_alloc(ncols, embed_dim);
+        for (int r = 0; r < ncols; r++) {
+            for (int c = 0; c < embed_dim; c++) {
+                dense_bf16_set(B_orig, r, c, float_to_bf16(random_float() * 2.0f - 1.0f));
+            }
+        }
+        B_amx = dense_bf16_permute_rows(B_orig, perm, ncols, B_rows_amx);
+    } else {
+        B_amx = dense_bf16_alloc(B_rows_amx, embed_dim);
+        for (int r = 0; r < ncols; r++) {
+            for (int c = 0; c < embed_dim; c++) {
+                dense_bf16_set(B_amx, r, c, float_to_bf16(random_float() * 2.0f - 1.0f));
+            }
         }
     }
 
-    DenseF32* C_amx = dense_f32_alloc(C_rows, embed_dim);
 
+    // amx run
+    DenseF32* C_amx_perm = dense_f32_alloc(C_rows_amx, embed_dim);
     t0 = now_sec();
     if (use_bcsr) {
-        amx_spmm_bcsr(A_bcsr, B, C_amx);
+        amx_spmm_bcsr(A_bcsr, B_amx, C_amx_perm);
     } else {
-        amx_spmm_csr(A_csr, B, C_amx);
+        amx_spmm_csr(A_csr, B_amx, C_amx_perm);
     }
     double elapsed = now_sec() - t0;
+
+    // unpermute C
+    DenseF32* C_amx;
+    if (perm != NULL) {
+        C_amx = dense_f32_unpermute_rows(C_amx_perm, perm, nrows, C_rows_amx);
+        dense_f32_free(C_amx_perm);
+    } else {
+        C_amx = C_amx_perm;
+    }
+
     printf("AMX spMM : %.3f s", elapsed);
 
-    csr_free(A_csr);
+    csr_free(A_csr_orig);
+    if (A_csr_perm) csr_free(A_csr_perm);
     bcsr_free(A_bcsr);
-    dense_bf16_free(B);
+    if (B_orig) dense_bf16_free(B_orig);
+    dense_bf16_free(B_amx);
     dense_f32_free(C_amx);
+    free(perm);
+    free(inv_perm);
 }
 
 // run program on all .mtx files in a directory
-static void run_mtx_directory(const char* dir, int embed_dim, int use_bcsr) {
+static void run_mtx_directory(const char* dir, int embed_dim, int use_bcsr, ReorderMethod reorder) {
     printf("\n========================================\n");
     printf("Source Directory : %s\n", dir);
     printf("embed_dim = %d,  format = %s\n",
@@ -938,7 +1326,7 @@ static void run_mtx_directory(const char* dir, int embed_dim, int use_bcsr) {
         if (len < 4 || strcmp(ent->d_name + len - 4, ".mtx") != 0) continue;
         char fullpath[4096];
         snprintf(fullpath, sizeof(fullpath), "%s/%s", dir, ent->d_name);
-        run_mtx_file(fullpath, embed_dim, use_bcsr);
+        run_mtx_file(fullpath, embed_dim, use_bcsr, reorder);
         count++;
     }
     closedir(d);
@@ -963,10 +1351,16 @@ Usage:
 int main(int argc, char** argv) {
     printf("Intel AMX BF16 spMM\n");
     printf("====================\n");
-    printf("sizeof(tilecfg_t)  = %zu  (must be 64)\n", sizeof(__tilecfg));
     printf("TILE_MAX_ROWS      = %d\n", TILE_MAX_ROWS);
     printf("TILE_MAX_FP32_COLS = %d\n", TILE_MAX_F32_COLS);
     printf("BCSR block         = %d x %d = %d BF16 elems (one full tile)\n\n", BCSR_BR, BCSR_BC, BCSR_BLOCK_ELEMS);
+
+#ifdef USE_AMD
+    printf("SuiteSparse available\n");
+#else
+    printf("SuiteSparse not compiled in, rebuild with -DUSE_AMD\n");
+#endif
+    printf("RCM available by default\n\n");
 
     if (request_amx_perm() != 1) {
         fprintf(stderr, "ERROR: Failed to enable AMX tile state.\n");
@@ -977,20 +1371,30 @@ int main(int argc, char** argv) {
     const char* mtx_dir = NULL;
     int embed_dim = 64;
     int use_bcsr = 0;
+    ReorderMethod reorder = REORDER_NONE;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--mtx") == 0 && i + 1 < argc) mtx_dir = argv[++i];
         else if (strcmp(argv[i], "--embed") == 0 && i + 1 < argc) embed_dim = atoi(argv[++i]);
         else if (strcmp(argv[i], "--bcsr") == 0) use_bcsr = 1;
+        else if (strcmp(argv[i], "--reorder") == 0 && i+1 < argc) {
+            const char* m = argv[++i];
+            if (strcmp(m, "amd") == 0) reorder = REORDER_AMD;
+            else if (strcmp(m, "rcm") == 0) reorder = REORDER_RCM;
+            else {
+                fprintf(stderr, "Unknown reorder method\n");
+                return 1;
+            }
+        }
         else {
             fprintf(stderr, "Unknown arg: %s\n", argv[i]);
-            fprintf(stderr, "Usage: %s [--mtx <dir>] [--embed 64|128] [--bcsr]\n", argv[0]);
+            fprintf(stderr, "Usage: %s [--mtx <dir>] [--embed 64|128] [--bcsr] [--reorder amd|rcm]\n", argv[0]);
             return 1;
         }
     }
 
     if (mtx_dir) {
-        run_mtx_directory(mtx_dir, embed_dim, use_bcsr);
+        run_mtx_directory(mtx_dir, embed_dim, use_bcsr, reorder);
         return 0;
     }
 }
