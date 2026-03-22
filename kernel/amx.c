@@ -1558,23 +1558,54 @@ static DenseF32* dense_f32_unpermute_rows(const DenseF32* C_perm, const int* per
 }
 
 
-/* ================= MTX EXTRACTION ================= */
+/* ================= BENCHMARKING HARNESS ================= */
 
-// run program on a single .mtx file
-static void run_mtx_file(const char* path, int embed_dim, int use_bcsr, ReorderMethod reorder, float cluster_thresh) {
-    printf("\n────────────────────────────────────────────────────────\n");
-    printf("  File : %s\n", path);
+#define N_RUNS 6
+#define N_TIMED 5
+#define BENCH_SEP    "────────────────────────────────────────────────────────"
 
-    // load mtx to CSR
-    int nrows, ncols;
-    double t0 = now_sec();
-    CSRMatrix* A_csr_orig = mtx_read_to_csr(path, &nrows, &ncols);
-    if (!A_csr_orig) return;
-    double t_load = now_sec() - t0;
+// Runs kernel N_RUNS times on given (A, B) pair, discards first result and prints mean and stddev of remaining runtimes.
+static void bench_one_config(const char* label, const CSRMatrix* A_csr, const BCSRMatrix* A_bcsr, const DenseBF16* B_amx, int embed_dim, int nrows, int C_rows_amx, const int* perm, const int* inv_perm) {
+    (void)inv_perm;
+    (void)perm;
+    (void)nrows;
+    int use_bcsr = (A_bcsr != NULL);
 
-    double sparsity = 1.0 - (double)A_csr_orig->nnz / ((double)nrows * ncols);
-    printf("A : %d x %d, nnz = %d, sparsity = %.2f%%\n", nrows, ncols, A_csr_orig->nnz, sparsity * 100);
-    printf("Load : %.3f s\n", t_load);
+    double times[N_RUNS];
+    DenseF32* C_perm = dense_f32_alloc(C_rows_amx, embed_dim);
+    if (!C_perm) {fprintf(stderr, "bench: C alloc failed"); return;}
+
+    for (int r = 0; r < N_RUNS; r++) {
+        double t0 = now_sec();
+        if (use_bcsr) amx_spmm_bcsr(A_bcsr, B_amx, C_perm);
+        else amx_spmm_csr(A_csr, B_amx, C_perm);
+        times[r] = now_sec() - t0;
+    }
+    dense_f32_free(C_perm);
+
+    // mean and stddev of timed runs
+    double sum = 0.0;
+    for (int r = 1; r < N_TIMED; r++) sum += times[r];
+    double mean = sum / N_TIMED;
+
+    double var = 0.0;
+    for (int r = 1; r < N_TIMED; r++) {
+        double d = times[r] - mean;
+        var += d * d;
+    }
+    double stddev = (N_TIMED > 1) ? sqrt(var / (N_TIMED - 1)) : 0.0;
+
+    printf(" %-22s  warmup=%5.3fs  mean=%6.3fs  stddev=%5.3fs\n", label, times[0], mean, stddev);
+}
+
+
+// Given original CSR and reorder method, compute permutation, apply to a CSR matrix and produce permuted A and B. Optionally convert to BCSR
+static int build_config(const CSRMatrix* A_orig, const DenseBF16* B_orig, int nrows, int ncols, int embed_dim, int use_bcsr, ReorderMethod reorder, float cluster_thresh, CSRMatrix** A_csr_perm_out, BCSRMatrix** A_bcsr_out, DenseBF16** B_amx_out, int** perm_out, int** inv_perm_out, int* B_rows_amx_out, int* C_rows_amx_out) {
+    *A_csr_perm_out = NULL;
+    *A_bcsr_out     = NULL;
+    *B_amx_out      = NULL;
+    *perm_out       = NULL;
+    *inv_perm_out   = NULL;
 
     // reordering
     int* perm = NULL, *inv_perm = NULL;
@@ -1582,133 +1613,174 @@ static void run_mtx_file(const char* path, int embed_dim, int use_bcsr, ReorderM
 
     if (reorder != REORDER_NONE) {
         if (nrows != ncols) {
-            printf(" [reorder] skipped, matrix is not square (%d x %d)\n", nrows, ncols);
-        } else {
-            perm = (int*)malloc((size_t)nrows * sizeof(int));
-            inv_perm = (int*)malloc((size_t)nrows * sizeof(int));
-            if (!perm || !inv_perm) {
-                perror("malloc perm");
-                free(perm);
-                free(inv_perm);
-                perm = inv_perm = NULL;
-            } else {
-                const char* method = (reorder == REORDER_AMD) ? "AMD" : (reorder == REORDER_RCM) ? "RCM" : "Cluster";
-                printf("Reorder : computing %s permutation\n", method);
-                t0 = now_sec();
-                int ok;
-                if (reorder == REORDER_AMD) {
-                    ok = compute_amd_order(A_csr_orig, perm);
-                } else if (reorder == REORDER_RCM) {
-                    ok = compute_rcm_order(A_csr_orig, perm);
-                } else {
-                    ok = compute_cluster_order(A_csr_orig, perm, cluster_thresh, CLUSTER_MAX_COL_DEGREE);
-                }
-                double t_order = now_sec() - t0;
-
-                if (ok != 0) {
-                    printf(" [reorder] %s failed, continuining without reorder\n", method);
-                    free(perm);
-                    free(inv_perm);
-                    perm = inv_perm = NULL;
-                } else {
-                    for (int i = 0; i < nrows; i++) inv_perm[perm[i]] = i;
-                    printf("Reorder : %.3f s (%s)\n", t_order, method);
-                    t0 = now_sec();
-                    A_csr_perm = csr_permute(A_csr_orig, perm, inv_perm);
-                    printf("Permute : %.3f s \n", now_sec() - t0);
-                }
-            }
+            printf("    [skip] matrix not square, cannot reorder\n");
+            return -1;
         }
+        perm = (int*)malloc((size_t)nrows * sizeof(int));
+        inv_perm = (int*)malloc((size_t)nrows * sizeof(int));
+        if (!perm || !inv_perm) {
+            perror("build_config perm"); free(perm); free(inv_perm); return -1;
+        }
+
+        double t0 = now_sec();
+        int ok = -1;
+        if      (reorder == REORDER_AMD)     ok = compute_amd_order(A_orig, perm);
+        else if (reorder == REORDER_RCM)     ok = compute_rcm_order(A_orig, perm);
+        else if (reorder == REORDER_CLUSTER) ok = compute_cluster_order(A_orig, perm, cluster_thresh, CLUSTER_MAX_COL_DEGREE);
+
+        if (ok != 0) {
+            printf("    [skip] reorder failed\n");
+            free(perm); free(inv_perm); return -1;
+        }
+        printf("    reorder : %.3f s\n", now_sec() - t0);
+
+        for (int i = 0; i < nrows; i++) inv_perm[perm[i]] = i;
+
+        t0 = now_sec();
+        A_csr_perm = csr_permute(A_orig, perm, inv_perm);
+        if (!A_csr_perm) {
+            printf("    [skip] csr_permute failed\n");
+            free(perm); free(inv_perm); return -1;
+        }
+        printf("    permute : %.3f s\n", now_sec() - t0);
     }
 
-    // A_csr used for AMX path, permuted if available, else original
-    CSRMatrix* A_csr = (A_csr_perm != NULL) ? A_csr_perm : A_csr_orig;
+    const CSRMatrix* A_csr = A_csr_perm ? A_csr_perm : A_orig;
 
-    // convert to BCSR 
+    // BCSR conversion
     BCSRMatrix* A_bcsr = NULL;
-    int B_rows_amx, C_rows_amx;     // effective dimensions, as the dimensions could be padded in bcsr
+    int B_rows_amx, C_rows_amx;
+
     if (use_bcsr) {
-        t0 = now_sec();
+        double t0 = now_sec();
         A_bcsr = csr_to_bcsr(A_csr);
         if (!A_bcsr) {
-            fprintf(stderr, " csr_to_bcsr failed (out of memory?) - skipping %s\n", path);
-            csr_free(A_csr_orig);
+            printf("    [skip] csr_to_bcsr failed (out of memory?)\n");
             if (A_csr_perm) csr_free(A_csr_perm);
-            free(perm);
-            free(inv_perm);
-            return;
+            free(perm); free(inv_perm); return -1;
         }
-        printf("CSR to BCSR : %.3f s (%d blocks, padded %dx%d to %dx%d)\n", now_sec() - t0, A_bcsr->nblocks, nrows, ncols, A_bcsr->nrows, A_bcsr->ncols);
-        B_rows_amx = A_bcsr->ncols; // padded N must match kernel A.ncols
-        C_rows_amx = A_bcsr->nrows; // padded M must match kernel A.nrows
+        float fill = (float)A_csr->nnz / ((float)A_bcsr->nblocks * BCSR_BLOCK_ELEMS) * 100.f;
+        printf("    CSR to BCSR : %.3f s (%d blocks, fill=%.1f%%)\n", now_sec() - t0, A_bcsr->nblocks, fill);
+        B_rows_amx = A_bcsr->ncols;
+        C_rows_amx = A_bcsr->nrows;
     } else {
         B_rows_amx = ncols;
         C_rows_amx = nrows;
     }
-    printf("B : %d x %d  (N x embed_dim)\n", B_rows_amx, embed_dim);
-    printf("C : %d x %d  (M x embed_dim)\n", C_rows_amx, embed_dim);
 
-    // allocate B
-    random_seed = 0xABCD1234u;
-
-    DenseBF16* B_orig = NULL;
+    // permute B
     DenseBF16* B_amx;
-
     if (perm != NULL) {
-        B_orig = dense_bf16_alloc(ncols, embed_dim);
-        for (int r = 0; r < ncols; r++) {
-            for (int c = 0; c < embed_dim; c++) {
-                dense_bf16_set(B_orig, r, c, float_to_bf16(random_float() * 2.0f - 1.0f));
-            }
-        }
         B_amx = dense_bf16_permute_rows(B_orig, perm, ncols, B_rows_amx);
     } else {
-        B_amx = dense_bf16_alloc(B_rows_amx, embed_dim);
-        for (int r = 0; r < ncols; r++) {
-            for (int c = 0; c < embed_dim; c++) {
-                dense_bf16_set(B_amx, r, c, float_to_bf16(random_float() * 2.0f - 1.0f));
+        // no reorder, B already has the correct layout
+        if (B_rows_amx > B_orig->rows) {
+            B_amx = dense_bf16_alloc(B_rows_amx, embed_dim);
+            if (!B_amx) {perror("build_config B_amx pad"); goto fail;}
+            for (int r = 0; r < B_orig->rows; r++) {
+                memcpy(B_amx->data + (size_t)r * B_amx->stride, B_orig->data + (size_t)r * B_orig->stride, (size_t)embed_dim * sizeof(uint16_t));
             }
+        } else {
+            // dims match, share data pointer via shallow copy struct
+            B_amx = (DenseBF16*)malloc(sizeof(DenseBF16));
+            if (!B_amx) {perror("build_config B_amx ref"); goto fail;}
+            *B_amx = *B_orig;
         }
     }
 
+    *A_csr_perm_out  = A_csr_perm;
+    *A_bcsr_out      = A_bcsr;
+    *B_amx_out       = B_amx;
+    *perm_out        = perm;
+    *inv_perm_out    = inv_perm;
+    *B_rows_amx_out  = B_rows_amx;
+    *C_rows_amx_out  = C_rows_amx;
+    return 0;
 
-    // amx run
-    DenseF32* C_amx_perm = dense_f32_alloc(C_rows_amx, embed_dim);
-    t0 = now_sec();
-    if (use_bcsr) {
-        amx_spmm_bcsr(A_bcsr, B_amx, C_amx_perm);
-    } else {
-        amx_spmm_csr(A_csr, B_amx, C_amx_perm);
-    }
-    double elapsed = now_sec() - t0;
-
-    // unpermute C
-    DenseF32* C_amx;
-    if (perm != NULL) {
-        C_amx = dense_f32_unpermute_rows(C_amx_perm, perm, nrows, C_rows_amx);
-        dense_f32_free(C_amx_perm);
-    } else {
-        C_amx = C_amx_perm;
-    }
-
-    printf("AMX spMM : %.3f s", elapsed);
-
-    csr_free(A_csr_orig);
+fail:
+    if (A_bcsr) bcsr_free(A_bcsr);
     if (A_csr_perm) csr_free(A_csr_perm);
-    bcsr_free(A_bcsr);
-    if (B_orig) dense_bf16_free(B_orig);
-    dense_bf16_free(B_amx);
-    dense_f32_free(C_amx);
     free(perm);
     free(inv_perm);
+    return -1;
+}
+
+/* ================= MTX EXTRACTION ================= */
+
+// run program on a single .mtx file
+static void run_mtx_file(const char* path, int embed_dim, float cluster_thresh) {
+    printf("\n%s\n", BENCH_SEP);
+    printf("  File : %s\n", path);
+
+    // load mtx to CSR
+    int nrows, ncols;
+    double t0 = now_sec();
+    CSRMatrix* A_orig = mtx_read_to_csr(path, &nrows, &ncols);
+    if (!A_orig) return;
+    double t_load = now_sec() - t0;
+
+    double sparsity = 1.0 - (double)A_orig->nnz / ((double)nrows * ncols);
+    printf("A : %d x %d  nnz = %d  sparsity = %.2f%%  load = %.3fs\n", nrows, ncols, A_orig->nnz, sparsity * 100, t_load);
+
+    // random seed for populating B
+    random_seed = 0xABCD1234u;
+    DenseBF16* B_orig = dense_bf16_alloc(ncols, embed_dim);
+    if (!B_orig) {perror("B_orig"); csr_free(A_orig); return;}
+    for (int r = 0; r < ncols; r++) {
+        for (int c = 0; c < embed_dim; c++) {
+            dense_bf16_set(B_orig, r, c, float_to_bf16(random_float() * 2.0f - 1.0f));
+        }
+    }
+    printf("\n");
+
+    // config table
+    static const struct {
+        const char* label;
+        int use_bcsr;
+        ReorderMethod reorder;
+    } configs[] = {
+        { "CSR",            0, REORDER_NONE    },
+        { "BCSR",           1, REORDER_NONE    },
+        { "BCSR + AMD",     1, REORDER_AMD     },
+        { "BCSR + RCM",     1, REORDER_RCM     },
+        { "BCSR + Cluster", 1, REORDER_CLUSTER }
+    };
+    int n_configs = (int)(sizeof(configs) / sizeof(configs[0]));
+
+    for (int ci = 0; ci < n_configs; ci++) {
+        printf("    [%s]\n", configs[ci].label);
+
+        CSRMatrix* A_csr_perm = NULL;
+        BCSRMatrix* A_bcsr = NULL;
+        DenseBF16* B_amx = NULL;
+        int* perm = NULL, *inv_perm = NULL;
+        int B_rows_amx, C_rows_amx;
+
+        int ok = build_config(A_orig, B_orig, nrows, ncols, embed_dim, configs[ci].use_bcsr, configs[ci].reorder, cluster_thresh, &A_csr_perm, &A_bcsr, &B_amx, &perm, &inv_perm, &B_rows_amx, &C_rows_amx);
+        if (ok != 0) {printf("\n"); continue;}
+
+        const CSRMatrix* A_csr_kernel = A_csr_perm ? A_csr_perm : A_orig;
+
+        bench_one_config(configs[ci].label, A_bcsr ? NULL : A_csr_kernel, A_bcsr, B_amx, embed_dim, nrows, C_rows_amx, perm, inv_perm);
+
+        if (A_csr_perm) csr_free(A_csr_perm);
+        bcsr_free(A_bcsr);
+        // free B_amx only if it owns its data (not shallow copy)
+        if (B_amx && B_amx->data != B_orig->data) dense_bf16_free(B_amx);
+        else free(B_amx);
+        free(perm); free(inv_perm);
+        printf("\n");
+    }
+    csr_free(A_orig);
+    dense_bf16_free(B_orig);
 }
 
 // run program on all .mtx files in a directory
-static void run_mtx_directory(const char* dir, int embed_dim, int use_bcsr, ReorderMethod reorder, float cluster_thresh) {
+static void run_mtx_directory(const char* dir, int embed_dim, float cluster_thresh) {
     printf("\n========================================\n");
     printf("Source Directory : %s\n", dir);
-    printf("embed_dim = %d,  format = %s\n",
-           embed_dim, use_bcsr ? "BCSR (tile blocks)" : "CSR");
+    printf("embed_dim = %d\n", embed_dim);
+    printf("runs = %d (warmup=1, timed=%d)\n", N_RUNS, N_TIMED);
     printf("========================================\n");
 
     DIR* d = opendir(dir);
@@ -1724,7 +1796,7 @@ static void run_mtx_directory(const char* dir, int embed_dim, int use_bcsr, Reor
         if (len < 4 || strcmp(ent->d_name + len - 4, ".mtx") != 0) continue;
         char fullpath[4096];
         snprintf(fullpath, sizeof(fullpath), "%s/%s", dir, ent->d_name);
-        run_mtx_file(fullpath, embed_dim, use_bcsr, reorder, cluster_thresh);
+        run_mtx_file(fullpath, embed_dim, cluster_thresh);
         count++;
     }
     closedir(d);
@@ -1744,7 +1816,7 @@ static void run_mtx_directory(const char* dir, int embed_dim, int use_bcsr, Reor
 Usage:
     ./amx --mtx <dir>                       - process all .mtx files in target directory
     ./amx --mtx <dir> --embed 128           - use embed dimension 128
-    ./amx --mtx <dir> --embed 128 --bcsr    - use BCSR format
+    ./amx --mtx <dir> --cluster-thresh      - Jaccard threshold for clustering
 */
 int main(int argc, char** argv) {
     printf("Intel AMX BF16 spMM\n");
@@ -1754,9 +1826,9 @@ int main(int argc, char** argv) {
     printf("BCSR block         = %d x %d = %d BF16 elems (one full tile)\n\n", BCSR_BR, BCSR_BC, BCSR_BLOCK_ELEMS);
 
 #ifdef USE_AMD
-    printf("AMD available (--reorder amd)\n");
+    printf("AMD available through SuiteSparse (--reorder amd)\n");
 #else
-    printf("SuiteSparse not compiled in, rebuild with -DUSE_AMD\n");
+    printf("AMD not available: SuiteSparse not compiled in (rebuild with -DUSE_AMD)\n");
 #endif
     printf("RCM available by default (--reorder rcm)\n");
     printf("Hierarchical Clustering available (--reorder cluster)\n\n");
@@ -1769,25 +1841,12 @@ int main(int argc, char** argv) {
     // CLI parsing
     const char* mtx_dir = NULL;
     int embed_dim = 64;
-    int use_bcsr = 0;
-    ReorderMethod reorder = REORDER_NONE;
     float cluster_thresh = CLUSTER_DEFAULT_THRESHOLD;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--mtx") == 0 && i + 1 < argc) mtx_dir = argv[++i];
         else if (strcmp(argv[i], "--embed") == 0 && i + 1 < argc) embed_dim = atoi(argv[++i]);
-        else if (strcmp(argv[i], "--bcsr") == 0) use_bcsr = 1;
         else if (strcmp(argv[i], "--cluster-thresh") == 0 && i + 1 < argc) cluster_thresh = (float)atof(argv[++i]);
-        else if (strcmp(argv[i], "--reorder") == 0 && i+1 < argc) {
-            const char* m = argv[++i];
-            if (strcmp(m, "amd") == 0) reorder = REORDER_AMD;
-            else if (strcmp(m, "rcm") == 0) reorder = REORDER_RCM;
-            else if (strcmp(m, "cluster") == 0) reorder = REORDER_CLUSTER;
-            else {
-                fprintf(stderr, "Unknown reorder method '%s', (choices: amd, rcm, cluster)\n", m);
-                return 1;
-            }
-        }
         else {
             fprintf(stderr, "Unknown arg: %s\n", argv[i]);
             fprintf(stderr, "Usage: %s [--mtx <dir>] [--embed 64|128] [--bcsr] [--reorder amd|rcm|cluster] [--cluster-thresh <thresh>]\n", argv[0]);
@@ -1796,7 +1855,7 @@ int main(int argc, char** argv) {
     }
 
     if (mtx_dir) {
-        run_mtx_directory(mtx_dir, embed_dim, use_bcsr, reorder, cluster_thresh);
+        run_mtx_directory(mtx_dir, embed_dim, cluster_thresh);
         return 0;
     }
 }
