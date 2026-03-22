@@ -8,6 +8,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <assert.h>
+#include <math.h>
 #include <time.h>
 
 
@@ -92,8 +93,7 @@ typedef struct __tile_config {
     uint8_t reserved2[8];
 } __tilecfg;
 
-// debug
-// _Static_assert(sizeof(__tilecfg) == 64, "tilecfg must be exactly 64 bytes");
+
 
 
 /*
@@ -146,16 +146,6 @@ static uint16_t float_to_bf16(float f) {
     union {uint32_t u; float f;} temp;
     temp.f = f;
     return (uint16_t)(temp.u >> 16);
-}
-
-static void print_f32_matrix(const char* lab, const float* M, int rows, int cols) {
-    printf("%s (%d x %d):\n", lab, rows, cols);
-    for (int i = 0; i < rows; i++) {
-        for (int j = 0; j < cols; j++) 
-            printf("%8.2f", M[i * cols + j]);
-        printf("\n");
-    }
-    printf("\n");
 }
 
 static double now_sec(void)
@@ -223,8 +213,8 @@ static CSRMatrix* csr_from_dense(const float* A, int nrows, int ncols) {
 
 
 
-#define BCSR_BR TILE_MAX_ROWS       // 16 - block height in rows
-#define BCSR_BC TILE_MAX_BF16_COLS  // 32 - block width in BF16 cols
+#define BCSR_BR TILE_MAX_ROWS                   // 16 - block height in rows
+#define BCSR_BC TILE_MAX_BF16_COLS              // 32 - block width in BF16 cols
 #define BCSR_BLOCK_ELEMS (BCSR_BR * BCSR_BC)    // 16 * 32 = 512
 
 
@@ -238,7 +228,7 @@ typedef struct {
     int nblocks;        // number non-zero blocks
     int* blockrowptr;   // [nblockrows + 1]
     int* blockcolidx;   // [nblocks]
-    uint16_t* values;    // [nblocks * BCSR_BLOCK_ELEMS], row major within each block
+    uint16_t* values;   // [nblocks * BCSR_BLOCK_ELEMS], row major within each block
 } BCSRMatrix;
 
 static BCSRMatrix* bcsr_alloc(int nrows, int ncols, int nblocks) {
@@ -400,8 +390,25 @@ static void amx_spmm_csr(const CSRMatrix* A, const DenseBF16* B, DenseF32* C) {
     int n_kstrips = (A->ncols + K_TILE - 1) / K_TILE;
     char *kstrip_used = (char *)calloc((size_t)n_kstrips, 1);
     if (!kstrip_used) { perror("amx_spmm_csr kstrip_used"); return; }
- 
-    for (int m0 = 0; m0 < M; m0 += TILE_MAX_ROWS) {
+
+    int total_m_tiles   = (M + TILE_MAX_ROWS - 1) / TILE_MAX_ROWS;
+    int report_interval = total_m_tiles / 20;          /* every ~5% */
+    if (report_interval < 1000) report_interval = 1000;
+    if (report_interval > total_m_tiles) report_interval = total_m_tiles;
+
+    double t_start   = now_sec();
+    int    m_tile_idx = 0;
+
+    for (int m0 = 0; m0 < M; m0 += TILE_MAX_ROWS, m_tile_idx++) {
+
+        if (m_tile_idx > 0 && m_tile_idx % report_interval == 0) {
+            double elapsed  = now_sec() - t_start;
+            double fraction = (double)m_tile_idx / total_m_tiles;
+            double eta      = elapsed / fraction - elapsed;
+            fprintf(stderr, "    CSR progress: %5.1f%%  elapsed=%.1fs  eta=%.1fs\n",
+                    fraction * 100.0, elapsed, eta);
+        }
+
         int m_tile = (m0 + TILE_MAX_ROWS <= M) ? TILE_MAX_ROWS : M - m0;
 
         int n_used = 0;
@@ -415,25 +422,23 @@ static void amx_spmm_csr(const CSRMatrix* A, const DenseBF16* B, DenseF32* C) {
         }
 
         if (n_used == 0) {
-            continue;   // entire M tile is zero, C already zeroed
+            continue;
         }
 
         for (int n0 = 0; n0 < N; n0 += TILE_MAX_F32_COLS) {
             int n_tile_f32 = (n0 + TILE_MAX_F32_COLS <= N) ? TILE_MAX_F32_COLS : N - n0;
 
-            // zero and load C tile
             memset(global_c_buf, 0, sizeof(global_c_buf));
             configure_amx_tiles_bf16(m_tile, n_tile_f32, K_TILE);
             _tile_loadd(TILE_C, global_c_buf, TILE_MAX_F32_COLS * (int)sizeof(float));
 
-            for (int ks = 0; ks <n_kstrips; ks++) {
+            for (int ks = 0; ks < n_kstrips; ks++) {
                 if (!kstrip_used[ks]) continue;
 
                 int k0 = ks * K_TILE;
                 int k_strip = (k0 + K_TILE <= K) ? K_TILE : A->ncols - k0;
                 int k_padded = (k_strip + 1) & ~1;
 
-                // build A: scatter nnzs from this k strip
                 memset(global_a_buf, 0, sizeof(global_a_buf));
                 for (int ii = 0; ii < m_tile; ii++) {
                     int row = m0 + ii;
@@ -446,18 +451,14 @@ static void amx_spmm_csr(const CSRMatrix* A, const DenseBF16* B, DenseF32* C) {
 
                 pack_b_tile(B, k0, k_padded, n0, n_tile_f32);
 
-                // update tile config for actual k_strip_padded as it could differ from K_TILE on the final strip
                 configure_amx_tiles_bf16(m_tile, n_tile_f32, k_padded);
                 _tile_loadd(TILE_C, global_c_buf, TILE_MAX_F32_COLS * (int)sizeof(float));
                 _tile_loadd(TILE_A, global_a_buf, K_TILE * (int)sizeof(uint16_t));
                 _tile_loadd(TILE_B, global_b_buf, n_tile_f32 * 2 * (int)sizeof(uint16_t));
                 _tile_dpbf16ps(TILE_C, TILE_A, TILE_B);
-
-                // save accumulator before reconfiguration
                 _tile_stored(TILE_C, global_c_buf, TILE_MAX_F32_COLS * (int)sizeof(float));
             }
 
-            // scatter C tile results into output matrix
             for (int ii = 0; ii < m_tile; ii++) {
                 int row = m0 + ii;
                 for (int jj = 0; jj < n_tile_f32; jj++) {
@@ -473,6 +474,7 @@ static void amx_spmm_csr(const CSRMatrix* A, const DenseBF16* B, DenseF32* C) {
             }
         }
     }
+    fprintf(stderr, "    CSR progress: 100.0%%  elapsed=%.1fs\n", now_sec() - t_start);
     free(kstrip_used);
     _tile_release();
 }
@@ -504,8 +506,8 @@ static void amx_spmm_bcsr(const BCSRMatrix* A, const DenseBF16* B, DenseF32* C) 
     size_t cacheelems = (size_t)nblockcols * n_blocks * B_CACHE_TILE_BF16;
     size_t cachebytes = cacheelems * sizeof(uint16_t);
 
-    // we only want to pre pack B into the cache if it fits within 512 MB, otherwise we can do it on the fly
-    int use_cache = (cachebytes <= (size_t)512 * 1024 * 1024);
+    // we only want to pre pack B into the cache if it fits within 8 GB, otherwise we can do it on the fly
+    int use_cache = (cachebytes <= (size_t)8 * 1024 * 1024 * 1024);
     if (use_cache) {
         if (posix_memalign((void **)&bcachedata, 64, cachebytes) != 0) {
             perror("posix_memalign b_cache");
@@ -514,7 +516,7 @@ static void amx_spmm_bcsr(const BCSRMatrix* A, const DenseBF16* B, DenseF32* C) 
             memset(bcachedata, 0, cachebytes);
         }
     }
-    if (!use_cache) printf(" [b_cache] %.0f MB > 512 MB, packing B on the fly\n", cachebytes / 1.0e6);
+    if (!use_cache) printf(" [b_cache] %.0f MB > 8 GB, packing B on the fly\n", cachebytes / 1.0e6);
 
     if (use_cache) {
         for (int bc = 0; bc < nblockcols; bc++) {
@@ -606,6 +608,7 @@ static void amx_spmm_bcsr(const BCSRMatrix* A, const DenseBF16* B, DenseF32* C) 
 
 #include <ctype.h>
 #include <dirent.h>
+#include <sys/stat.h>
 #include <time.h>
 #include "../utility/mmio.h"
 
@@ -805,8 +808,6 @@ static BCSRMatrix *csr_to_bcsr(const CSRMatrix *csr)
     int nbr   = nrows / BCSR_BR;
     int nbc   = ncols / BCSR_BC;
 
-    /* Pass 1: mark which (br, bc) blocks are non-zero.
-     * use a per-block-row byte array of width nbc.  nbc can be large */
     char *row_nz = (char *)calloc((size_t)nbc, 1);          // reused per block-row 
     if (!row_nz) { perror("calloc row_nz"); return NULL; }
 
@@ -889,18 +890,6 @@ static int colval_cmp(const void* a, const void* b) {
     return ((const ColValPair*)a)->col - ((const ColValPair*)b)->col;
 }
 
-// undirected edge, used by build_sym_adj
-typedef struct {
-    int r, c;
-} SymEdge;
-
-static int symedge_cmp(const void* a, const void* b) {
-    const SymEdge* x = (const SymEdge*)a, *y = (const SymEdge*)b;
-    if (x->r != y->r) {
-        return x->r - y->r;
-    }
-    return x->c - y->c;
-}
 
 
 /*  
@@ -911,81 +900,67 @@ static int symedge_cmp(const void* a, const void* b) {
 */
 static int build_sym_adj(const CSRMatrix* A, int **out_ptr, int **out_idx) {
     int n = A->nrows;
-
-    // Pass 1, compute symmetric degree. For each off diag elt add both i->j and j->i
-    // use temp per node count to track reverse edges already in the original CSR
-    int* ptr = (int*)calloc((size_t)(n+1), sizeof(int));
-    if (!ptr) {perror("build_sym_adj ptr"); return -1;}
-
-    // count forward edges skipping diag
+ 
+    int* ptr = (int*)calloc((size_t)(n + 1), sizeof(int));
+    if (!ptr) { perror("build_sym_adj ptr"); return -1; }
+ 
+    // Pass 1a: count forward (off-diagonal) edges
+    for (int i = 0; i < n; i++)
+        for (int p = A->rowptr[i]; p < A->rowptr[i+1]; p++)
+            if (A->colidx[p] != i) ptr[i + 1]++;
+ 
+    // Pass 1b: count reverse edges j→i missing from row j
     for (int i = 0; i < n; i++) {
-        for (int p = A->rowptr[i]; p < A->rowptr[i+1]; p++) {
-            if (A->colidx[p] != i) ptr[i+1]++;
-        }
-    }
-
-    // count reverse edges not present
-    char* present = (char*)calloc((size_t)n, 1);
-    if (!present) {perror("build_sym_adj present"); free(ptr); return -1;}
-
-    for (int i = 0; i < n; i++) {
-        // mark all columns that appear in row i
-        for (int p = A->rowptr[i]; p < A->rowptr[i+1]; p++) {
-            present[A->colidx[p]] = 1;
-        }
-        // for each row j that has i as a column, add reverse if needed
         for (int p = A->rowptr[i]; p < A->rowptr[i+1]; p++) {
             int j = A->colidx[p];
             if (j == i) continue;
-            if (!present[i]) ptr[j+1]++;
-        }
-        // unmark
-        for (int p = A->rowptr[i]; p < A->rowptr[i+1]; p++) {
-            present[A->colidx[p]] = 0;
+            // binary search for i in the sorted colidx of row j
+            int lo = A->rowptr[j], hi = A->rowptr[j + 1], found = 0;
+            while (lo < hi) {
+                int mid = (lo + hi) >> 1;
+                if      (A->colidx[mid] == i) { found = 1; break; }
+                else if (A->colidx[mid]  < i)   lo = mid + 1;
+                else                             hi = mid;
+            }
+            if (!found) ptr[j + 1]++;
         }
     }
-
-    free(present);
-
-    // prefix sum to get row start offsets
-    for (int i = 0; i < n; i++) ptr[i+1] += ptr[i];
+ 
+    // prefix sum
+    for (int i = 0; i < n; i++) ptr[i + 1] += ptr[i];
     int total_edges = ptr[n];
-    
+ 
     int* idx = (int*)malloc((size_t)total_edges * sizeof(int));
-    int* cur = (int*)malloc((size_t)n * sizeof(int));
+    int* cur = (int*)malloc((size_t)n           * sizeof(int));
     if (!idx || !cur) {
         perror("build_sym_adj idx");
-        free(ptr);
-        free(idx);
-        free(cur);
-        return -1;
+        free(ptr); free(idx); free(cur); return -1;
     }
-
     memcpy(cur, ptr, (size_t)n * sizeof(int));
-
-    // pass 2: fill forward edges
-    for (int i = 0; i < n; i++) {
+ 
+    // Pass 2a: fill forward edges
+    for (int i = 0; i < n; i++)
         for (int p = A->rowptr[i]; p < A->rowptr[i+1]; p++) {
             int j = A->colidx[p];
             if (j != i) idx[cur[i]++] = j;
         }
-    }
-
-    // pass 2.1: fill reverse edges where missing
-    present = (char*)calloc((size_t)n, 1);
-    if (!present) {perror("build_sym_adj present2"); free(ptr); free(cur); free(idx); return -1;}
-
+ 
+    // Pass 2b: fill missing reverse edges (same binary search)
     for (int i = 0; i < n; i++) {
-        for (int p = A->rowptr[i]; p < A->rowptr[i+1]; p++) present[A->colidx[p]] = 1;
         for (int p = A->rowptr[i]; p < A->rowptr[i+1]; p++) {
             int j = A->colidx[p];
             if (j == i) continue;
-            if (!present[i]) idx[cur[j]++] = i; // add reverse j->i
+            int lo = A->rowptr[j], hi = A->rowptr[j + 1], found = 0;
+            while (lo < hi) {
+                int mid = (lo + hi) >> 1;
+                if      (A->colidx[mid] == i) { found = 1; break; }
+                else if (A->colidx[mid]  < i)   lo = mid + 1;
+                else                             hi = mid;
+            }
+            if (!found) idx[cur[j]++] = i;
         }
-        for (int p = A->rowptr[i]; p < A->rowptr[i+1]; p++) present[A->colidx[p]] = 0;
     }
-
-    free(present);
+ 
     free(cur);
     *out_ptr = ptr;
     *out_idx = idx;
@@ -1060,16 +1035,16 @@ static int compute_rcm_order(const CSRMatrix* A, int* perm) {
         fprintf(stderr, "RCM requires square matrix (%d x %d)\n", n, A->ncols);
         return -1;
     }
-
+ 
     int *adj_ptr = NULL, *adj_idx = NULL;
     if (build_sym_adj(A, &adj_ptr, &adj_idx) != 0) return -1;
-
+ 
     int* degree = (int*)malloc((size_t)n * sizeof(int));
     char* visited = (char*)calloc((size_t)n, 1);
     int* queue = (int*)malloc((size_t)n * sizeof(int));
     int* nbuf = (int*)malloc((size_t)n * sizeof(int)); // holds unvisited neighbours for counting sort
     int max_deg = 0;    // for sorting bucket array
-
+ 
     if (!degree || !visited || !queue || !nbuf) {
         perror("RCM alloc");
         free(adj_ptr);
@@ -1080,12 +1055,12 @@ static int compute_rcm_order(const CSRMatrix* A, int* perm) {
         free(nbuf);
         return -1;
     }
-
+ 
     for (int i = 0; i < n; i++) {
         degree[i] = adj_ptr[i+1] - adj_ptr[i];
         if (degree[i] > max_deg) max_deg = degree[i];
     }
-
+ 
     // counting sort bucket, indexed by degree value
     int* bucket = (int*)calloc((size_t)(max_deg + 2), sizeof(int));
     int* sorted_nb = (int*)malloc((size_t)n * sizeof(int));
@@ -1101,25 +1076,25 @@ static int compute_rcm_order(const CSRMatrix* A, int* perm) {
         free(sorted_nb);
         return -1;
     }
-
-
+ 
+ 
     int total = 0;      // nodes placed into perm[] so far
     int search = 0;     // cursor for finding next unvisited node
     while (total < n) {
         // advance past already visited nodes
         while (search < n && visited[search]) search++;
         if (search == n) break;
-
+ 
         int s = pseudo_peripheral_node(search, adj_ptr, adj_idx, degree, visited, queue, n);
-
+ 
         int qhead = 0, qtail = 0;
         visited[s] = 1;
         queue[qtail++] = s;
-
+ 
         while (qhead < qtail) {
             int u = queue[qhead++];
             perm[total++] = u;
-
+ 
             // collect neighbours
             int nn = 0;
             for (int p = adj_ptr[u]; p < adj_ptr[u+1]; p++) {
@@ -1129,35 +1104,35 @@ static int compute_rcm_order(const CSRMatrix* A, int* perm) {
                     nbuf[nn++] = v;
                 }    
             }
-
+ 
             if (nn == 0) continue;
-
+ 
             // counting sort nbuf by degree ascending
             //track local degree range
             int local_max_deg = 0;
             for (int a = 0; a < nn; a++) if (degree[nbuf[a]] > local_max_deg) local_max_deg = degree[nbuf[a]];
-
-
+ 
+ 
             // count
             for (int a = 0; a < nn; a++) bucket[degree[nbuf[a]]]++;
             // prefix sum
             for (int d = 1; d <= local_max_deg + 1; d++) bucket[d] += bucket[d-1];
             // place in reverse for stability
             for (int a = nn - 1; a >= 0; a--) sorted_nb[--bucket[degree[nbuf[a]]]] = nbuf[a];
-            // reset buckets 
-            memset(bucket, 0, (local_max_deg + 1) * sizeof(int));
-
+            // reset the full range touched by the prefix sum, including bucket[local_max_deg+1]
+            memset(bucket, 0, (local_max_deg + 2) * sizeof(int));
+ 
             for (int a = 0; a < nn; a++) queue[qtail++] = sorted_nb[a];
         }
     }
-
+ 
     // CM to RCM
     for (int i = 0; i < n / 2; i++) {
         int t = perm[i]; 
         perm[i] = perm[n-1-i];
         perm[n-1-i] = t;
     }
-
+ 
     free(adj_ptr);
     free(adj_idx);
     free(degree);
@@ -1242,9 +1217,7 @@ static int cluster_cmp(const void* a, const void* b) {
 
 
 // fills perm[0..n-1] with a permutation that groups similar rows into consecutive bands of BCSR_BR rows
-static int compute_cluster_order(const CSRMatrix* A, int* perm,
-                                  float sim_threshold, int max_col_degree)
-{
+static int compute_cluster_order(const CSRMatrix* A, int* perm, float sim_threshold, int max_col_degree) {
     int n   = A->nrows;
     int m   = A->ncols;
     int nnz = A->nnz;
@@ -1564,48 +1537,16 @@ static DenseF32* dense_f32_unpermute_rows(const DenseF32* C_perm, const int* per
 #define N_TIMED 5
 #define BENCH_SEP    "────────────────────────────────────────────────────────"
 
-// Runs kernel N_RUNS times on given (A, B) pair, discards first result and prints mean and stddev of remaining runtimes.
-static void bench_one_config(const char* label, const CSRMatrix* A_csr, const BCSRMatrix* A_bcsr, const DenseBF16* B_amx, int embed_dim, int nrows, int C_rows_amx, const int* perm, const int* inv_perm) {
-    (void)inv_perm;
-    (void)perm;
-    (void)nrows;
-    int use_bcsr = (A_bcsr != NULL);
-
-    double times[N_RUNS];
-    DenseF32* C_perm = dense_f32_alloc(C_rows_amx, embed_dim);
-    if (!C_perm) {fprintf(stderr, "bench: C alloc failed"); return;}
-
-    for (int r = 0; r < N_RUNS; r++) {
-        double t0 = now_sec();
-        if (use_bcsr) amx_spmm_bcsr(A_bcsr, B_amx, C_perm);
-        else amx_spmm_csr(A_csr, B_amx, C_perm);
-        times[r] = now_sec() - t0;
-    }
-    dense_f32_free(C_perm);
-
-    // mean and stddev of timed runs
-    double sum = 0.0;
-    for (int r = 1; r < N_TIMED; r++) sum += times[r];
-    double mean = sum / N_TIMED;
-
-    double var = 0.0;
-    for (int r = 1; r < N_TIMED; r++) {
-        double d = times[r] - mean;
-        var += d * d;
-    }
-    double stddev = (N_TIMED > 1) ? sqrt(var / (N_TIMED - 1)) : 0.0;
-
-    printf(" %-22s  warmup=%5.3fs  mean=%6.3fs  stddev=%5.3fs\n", label, times[0], mean, stddev);
-}
-
-
 // Given original CSR and reorder method, compute permutation, apply to a CSR matrix and produce permuted A and B. Optionally convert to BCSR
-static int build_config(const CSRMatrix* A_orig, const DenseBF16* B_orig, int nrows, int ncols, int embed_dim, int use_bcsr, ReorderMethod reorder, float cluster_thresh, CSRMatrix** A_csr_perm_out, BCSRMatrix** A_bcsr_out, DenseBF16** B_amx_out, int** perm_out, int** inv_perm_out, int* B_rows_amx_out, int* C_rows_amx_out) {
+static int build_config(const CSRMatrix* A_orig, const DenseBF16* B_orig, int nrows, int ncols, int embed_dim, int use_bcsr, ReorderMethod reorder, float cluster_thresh, CSRMatrix** A_csr_perm_out, BCSRMatrix** A_bcsr_out, DenseBF16** B_amx_out, int** perm_out, int** inv_perm_out, int* B_rows_amx_out, int* C_rows_amx_out, double* t_reorder_out, double* t_permute_out, double* t_bcsr_out) {
     *A_csr_perm_out = NULL;
-    *A_bcsr_out     = NULL;
-    *B_amx_out      = NULL;
-    *perm_out       = NULL;
-    *inv_perm_out   = NULL;
+    *A_bcsr_out = NULL;
+    *B_amx_out = NULL;
+    *perm_out = NULL;
+    *inv_perm_out = NULL;
+    *t_reorder_out = 0.0;
+    *t_permute_out = 0.0;
+    *t_bcsr_out = 0.0;
 
     // reordering
     int* perm = NULL, *inv_perm = NULL;
@@ -1624,7 +1565,7 @@ static int build_config(const CSRMatrix* A_orig, const DenseBF16* B_orig, int nr
 
         double t0 = now_sec();
         int ok = -1;
-        if      (reorder == REORDER_AMD)     ok = compute_amd_order(A_orig, perm);
+        if (reorder == REORDER_AMD)     ok = compute_amd_order(A_orig, perm);
         else if (reorder == REORDER_RCM)     ok = compute_rcm_order(A_orig, perm);
         else if (reorder == REORDER_CLUSTER) ok = compute_cluster_order(A_orig, perm, cluster_thresh, CLUSTER_MAX_COL_DEGREE);
 
@@ -1632,7 +1573,8 @@ static int build_config(const CSRMatrix* A_orig, const DenseBF16* B_orig, int nr
             printf("    [skip] reorder failed\n");
             free(perm); free(inv_perm); return -1;
         }
-        printf("    reorder : %.3f s\n", now_sec() - t0);
+        *t_reorder_out = now_sec() - t0;
+        printf("    reorder : %.3f s\n", *t_reorder_out);
 
         for (int i = 0; i < nrows; i++) inv_perm[perm[i]] = i;
 
@@ -1642,7 +1584,8 @@ static int build_config(const CSRMatrix* A_orig, const DenseBF16* B_orig, int nr
             printf("    [skip] csr_permute failed\n");
             free(perm); free(inv_perm); return -1;
         }
-        printf("    permute : %.3f s\n", now_sec() - t0);
+        *t_permute_out = now_sec() - t0;
+        printf("    permute : %.3f s\n", *t_permute_out);
     }
 
     const CSRMatrix* A_csr = A_csr_perm ? A_csr_perm : A_orig;
@@ -1659,8 +1602,9 @@ static int build_config(const CSRMatrix* A_orig, const DenseBF16* B_orig, int nr
             if (A_csr_perm) csr_free(A_csr_perm);
             free(perm); free(inv_perm); return -1;
         }
+        *t_bcsr_out = now_sec() - t0;
         float fill = (float)A_csr->nnz / ((float)A_bcsr->nblocks * BCSR_BLOCK_ELEMS) * 100.f;
-        printf("    CSR to BCSR : %.3f s (%d blocks, fill=%.1f%%)\n", now_sec() - t0, A_bcsr->nblocks, fill);
+        printf("    CSR to BCSR : %.3f s (%d blocks, fill=%.1f%%)\n", *t_bcsr_out, A_bcsr->nblocks, fill);
         B_rows_amx = A_bcsr->ncols;
         C_rows_amx = A_bcsr->nrows;
     } else {
@@ -1689,12 +1633,12 @@ static int build_config(const CSRMatrix* A_orig, const DenseBF16* B_orig, int nr
     }
 
     *A_csr_perm_out  = A_csr_perm;
-    *A_bcsr_out      = A_bcsr;
-    *B_amx_out       = B_amx;
-    *perm_out        = perm;
-    *inv_perm_out    = inv_perm;
-    *B_rows_amx_out  = B_rows_amx;
-    *C_rows_amx_out  = C_rows_amx;
+    *A_bcsr_out = A_bcsr;
+    *B_amx_out = B_amx;
+    *perm_out = perm;
+    *inv_perm_out = inv_perm;
+    *B_rows_amx_out = B_rows_amx;
+    *C_rows_amx_out = C_rows_amx;
     return 0;
 
 fail:
@@ -1705,40 +1649,69 @@ fail:
     return -1;
 }
 
+
+typedef enum { MODE_ALL = 0, MODE_CSR = 1, MODE_BCSR = 2 } BenchMode;
+typedef struct { double warmup, mean, stddev; int skipped; } BenchResult;
+
+static BenchResult bench_one_config(const char* label, const CSRMatrix* A_csr, const BCSRMatrix* A_bcsr, const DenseBF16* B_amx, int embed_dim, int nrows, int C_rows_amx, const int* perm, const int* inv_perm) {
+    (void)perm; (void)inv_perm; (void)nrows;
+    BenchResult res = {0};
+    int use_bcsr = (A_bcsr != NULL);
+
+    double times[N_RUNS];
+    DenseF32* C_perm = dense_f32_alloc(C_rows_amx, embed_dim);
+    if (!C_perm) { fprintf(stderr, "bench: C alloc failed\n"); res.skipped = 1; return res; }
+
+    for (int r = 0; r < N_RUNS; r++) {
+        double t0 = now_sec();
+        if (use_bcsr) amx_spmm_bcsr(A_bcsr, B_amx, C_perm);
+        else amx_spmm_csr (A_csr,  B_amx, C_perm);
+        times[r] = now_sec() - t0;
+    }
+    dense_f32_free(C_perm);
+
+    double sum = 0.0;
+    for (int r = 1; r <= N_TIMED; r++) sum += times[r];
+    res.mean = sum / N_TIMED;
+    double var = 0.0;
+    for (int r = 1; r <= N_TIMED; r++) { double d = times[r] - res.mean; var += d*d; }
+    res.warmup = times[0];
+    res.stddev = (N_TIMED > 1) ? sqrt(var / (N_TIMED - 1)) : 0.0;
+    printf(" %-22s  warmup=%5.3fs  mean=%6.3fs  stddev=%5.3fs\n", label, res.warmup, res.mean, res.stddev);
+    return res;
+}
+
+static void csv_write_header(FILE* csv) {
+    fprintf(csv, "matrix,nrows,ncols,nnz,sparsity_pct,embed_dim,config,reorder_s,permute_s,bcsr_convert_s,nblocks,fill_pct,warmup_s,mean_s,stddev_s\n");
+}
+
 /* ================= MTX EXTRACTION ================= */
 
 // run program on a single .mtx file
-static void run_mtx_file(const char* path, int embed_dim, float cluster_thresh) {
+static void run_mtx_file(const char* path, int embed_dim, float cluster_thresh, BenchMode mode, FILE* csv) {
     printf("\n%s\n", BENCH_SEP);
     printf("  File : %s\n", path);
 
-    // load mtx to CSR
     int nrows, ncols;
     double t0 = now_sec();
     CSRMatrix* A_orig = mtx_read_to_csr(path, &nrows, &ncols);
     if (!A_orig) return;
-    double t_load = now_sec() - t0;
 
     double sparsity = 1.0 - (double)A_orig->nnz / ((double)nrows * ncols);
-    printf("A : %d x %d  nnz = %d  sparsity = %.2f%%  load = %.3fs\n", nrows, ncols, A_orig->nnz, sparsity * 100, t_load);
+    printf("A : %d x %d  nnz = %d  sparsity = %.2f%%  load = %.3fs\n", nrows, ncols, A_orig->nnz, sparsity * 100, now_sec() - t0);
 
-    // random seed for populating B
+    const char* matrix_name = strrchr(path, '/');
+    matrix_name = matrix_name ? matrix_name + 1 : path;
+
     random_seed = 0xABCD1234u;
     DenseBF16* B_orig = dense_bf16_alloc(ncols, embed_dim);
-    if (!B_orig) {perror("B_orig"); csr_free(A_orig); return;}
-    for (int r = 0; r < ncols; r++) {
-        for (int c = 0; c < embed_dim; c++) {
+    if (!B_orig) { perror("B_orig"); csr_free(A_orig); return; }
+    for (int r = 0; r < ncols; r++)
+        for (int c = 0; c < embed_dim; c++)
             dense_bf16_set(B_orig, r, c, float_to_bf16(random_float() * 2.0f - 1.0f));
-        }
-    }
     printf("\n");
 
-    // config table
-    static const struct {
-        const char* label;
-        int use_bcsr;
-        ReorderMethod reorder;
-    } configs[] = {
+    static const struct { const char* label; int use_bcsr; ReorderMethod reorder; } configs[] = {
         { "CSR",            0, REORDER_NONE    },
         { "BCSR",           1, REORDER_NONE    },
         { "BCSR + AMD",     1, REORDER_AMD     },
@@ -1748,24 +1721,46 @@ static void run_mtx_file(const char* path, int embed_dim, float cluster_thresh) 
     int n_configs = (int)(sizeof(configs) / sizeof(configs[0]));
 
     for (int ci = 0; ci < n_configs; ci++) {
+        if (mode == MODE_CSR  &&  configs[ci].use_bcsr) continue;
+        if (mode == MODE_BCSR && !configs[ci].use_bcsr) continue;
+
         printf("    [%s]\n", configs[ci].label);
 
-        CSRMatrix* A_csr_perm = NULL;
-        BCSRMatrix* A_bcsr = NULL;
-        DenseBF16* B_amx = NULL;
+        CSRMatrix*  A_csr_perm = NULL;
+        BCSRMatrix* A_bcsr     = NULL;
+        DenseBF16*  B_amx      = NULL;
         int* perm = NULL, *inv_perm = NULL;
-        int B_rows_amx, C_rows_amx;
+        int  B_rows_amx, C_rows_amx;
+        double t_reorder = 0.0, t_permute = 0.0, t_bcsr_conv = 0.0;
 
-        int ok = build_config(A_orig, B_orig, nrows, ncols, embed_dim, configs[ci].use_bcsr, configs[ci].reorder, cluster_thresh, &A_csr_perm, &A_bcsr, &B_amx, &perm, &inv_perm, &B_rows_amx, &C_rows_amx);
-        if (ok != 0) {printf("\n"); continue;}
+        int ok = build_config(A_orig, B_orig, nrows, ncols, embed_dim, configs[ci].use_bcsr, configs[ci].reorder, cluster_thresh, &A_csr_perm, &A_bcsr, &B_amx, &perm, &inv_perm, &B_rows_amx, &C_rows_amx, &t_reorder, &t_permute, &t_bcsr_conv);
+
+        if (ok != 0) {
+            if (csv)
+                fprintf(csv, "%s,%d,%d,%d,%.4f,%d,%s,,,,,,,,skipped\n", matrix_name, nrows, ncols, A_orig->nnz, sparsity * 100.0, embed_dim, configs[ci].label);
+            printf("\n");
+            continue;
+        }
+
+        int   nblocks  = A_bcsr ? A_bcsr->nblocks : 0;
+        float fill_pct = A_bcsr ? (float)A_orig->nnz / ((float)nblocks * BCSR_BLOCK_ELEMS) * 100.f : 0.f;
 
         const CSRMatrix* A_csr_kernel = A_csr_perm ? A_csr_perm : A_orig;
+        BenchResult res = bench_one_config(configs[ci].label, A_bcsr ? NULL : A_csr_kernel, A_bcsr, B_amx, embed_dim, nrows, C_rows_amx, perm, inv_perm);
 
-        bench_one_config(configs[ci].label, A_bcsr ? NULL : A_csr_kernel, A_bcsr, B_amx, embed_dim, nrows, C_rows_amx, perm, inv_perm);
+        if (csv && !res.skipped) {
+            fprintf(csv, "%s,%d,%d,%d,%.4f,%d,%s,%.3f,%.3f,%.3f,%d,%.2f,%.6f,%.6f,%.6f\n",
+                    matrix_name, nrows, ncols, A_orig->nnz,
+                    sparsity * 100.0, embed_dim,
+                    configs[ci].label,
+                    t_reorder, t_permute, t_bcsr_conv,
+                    nblocks, fill_pct,
+                    res.warmup, res.mean, res.stddev);
+            fflush(csv);
+        }
 
         if (A_csr_perm) csr_free(A_csr_perm);
         bcsr_free(A_bcsr);
-        // free B_amx only if it owns its data (not shallow copy)
         if (B_amx && B_amx->data != B_orig->data) dense_bf16_free(B_amx);
         else free(B_amx);
         free(perm); free(inv_perm);
@@ -1776,7 +1771,7 @@ static void run_mtx_file(const char* path, int embed_dim, float cluster_thresh) 
 }
 
 // run program on all .mtx files in a directory
-static void run_mtx_directory(const char* dir, int embed_dim, float cluster_thresh) {
+static void run_mtx_directory(const char* dir, int embed_dim, float cluster_thresh, BenchMode mode, FILE* csv) {
     printf("\n========================================\n");
     printf("Source Directory : %s\n", dir);
     printf("embed_dim = %d\n", embed_dim);
@@ -1784,10 +1779,7 @@ static void run_mtx_directory(const char* dir, int embed_dim, float cluster_thre
     printf("========================================\n");
 
     DIR* d = opendir(dir);
-    if (!d) {
-        perror(dir); 
-        return;
-    }
+    if (!d) { perror(dir); return; }
 
     struct dirent* ent;
     int count = 0;
@@ -1796,27 +1788,27 @@ static void run_mtx_directory(const char* dir, int embed_dim, float cluster_thre
         if (len < 4 || strcmp(ent->d_name + len - 4, ".mtx") != 0) continue;
         char fullpath[4096];
         snprintf(fullpath, sizeof(fullpath), "%s/%s", dir, ent->d_name);
-        run_mtx_file(fullpath, embed_dim, cluster_thresh);
+        run_mtx_file(fullpath, embed_dim, cluster_thresh, mode, csv);
         count++;
     }
     closedir(d);
-
-    if (count == 0) {
-        printf("(no .mtx files found in %s)\n", dir);
-    } else {
-        printf("\nProcessed %d files.\n", count);
-    }
+    if (count == 0) printf("(no .mtx files found in %s)\n", dir);
+    else printf("\nProcessed %d files.\n", count);
 }
 
 
 
 /* ================= MAIN ================= */
 
-/* 
+/*
 Usage:
-    ./amx --mtx <dir>                       - process all .mtx files in target directory
-    ./amx --mtx <dir> --embed 128           - use embed dimension 128
-    ./amx --mtx <dir> --cluster-thresh      - Jaccard threshold for clustering
+    ./amx --mtx <file|dir>                     single file or whole directory
+    ./amx --mtx <path> --embed 128             embed dimension (default 64)
+    ./amx --mtx <path> --mode csr              CSR only
+    ./amx --mtx <path> --mode bcsr             BCSR variants only
+    ./amx --mtx <path> --mode all              all configs (default)
+    ./amx --mtx <path> --cluster-thresh 0.1    Jaccard threshold
+    ./amx --mtx <path> --csv results.csv       write results to CSV
 */
 int main(int argc, char** argv) {
     printf("Intel AMX BF16 spMM\n");
@@ -1824,38 +1816,63 @@ int main(int argc, char** argv) {
     printf("TILE_MAX_ROWS      = %d\n", TILE_MAX_ROWS);
     printf("TILE_MAX_FP32_COLS = %d\n", TILE_MAX_F32_COLS);
     printf("BCSR block         = %d x %d = %d BF16 elems (one full tile)\n\n", BCSR_BR, BCSR_BC, BCSR_BLOCK_ELEMS);
-
 #ifdef USE_AMD
-    printf("AMD available through SuiteSparse (--reorder amd)\n");
+    printf("AMD available through SuiteSparse\n");
 #else
-    printf("AMD not available: SuiteSparse not compiled in (rebuild with -DUSE_AMD)\n");
+    printf("AMD not available: rebuild with -DUSE_AMD\n");
 #endif
-    printf("RCM available by default (--reorder rcm)\n");
-    printf("Hierarchical Clustering available (--reorder cluster)\n\n");
+    printf("RCM available by default\n");
+    printf("Hierarchical Clustering available\n\n");
 
     if (request_amx_perm() != 1) {
         fprintf(stderr, "ERROR: Failed to enable AMX tile state.\n");
         return 1;
     }
 
-    // CLI parsing
-    const char* mtx_dir = NULL;
+    const char* mtx_path = NULL;
+    const char* csv_path = NULL;
     int embed_dim = 64;
     float cluster_thresh = CLUSTER_DEFAULT_THRESHOLD;
+    BenchMode mode = MODE_ALL;
 
     for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "--mtx") == 0 && i + 1 < argc) mtx_dir = argv[++i];
-        else if (strcmp(argv[i], "--embed") == 0 && i + 1 < argc) embed_dim = atoi(argv[++i]);
-        else if (strcmp(argv[i], "--cluster-thresh") == 0 && i + 1 < argc) cluster_thresh = (float)atof(argv[++i]);
-        else {
+        if (strcmp(argv[i], "--mtx") == 0 && i+1 < argc) mtx_path = argv[++i];
+        else if (strcmp(argv[i], "--embed") == 0 && i+1 < argc) embed_dim = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--cluster-thresh") == 0 && i+1 < argc) cluster_thresh = (float)atof(argv[++i]);
+        else if (strcmp(argv[i], "--csv") == 0 && i+1 < argc) csv_path = argv[++i];
+        else if (strcmp(argv[i], "--mode") == 0 && i+1 < argc) {
+            const char* m = argv[++i];
+            if (strcmp(m, "csr")  == 0) mode = MODE_CSR;
+            else if (strcmp(m, "bcsr") == 0) mode = MODE_BCSR;
+            else if (strcmp(m, "all")  == 0) mode = MODE_ALL;
+            else { fprintf(stderr, "Unknown mode '%s' (choices: csr, bcsr, all)\n", m); return 1; }
+        } else {
             fprintf(stderr, "Unknown arg: %s\n", argv[i]);
-            fprintf(stderr, "Usage: %s [--mtx <dir>] [--embed 64|128] [--bcsr] [--reorder amd|rcm|cluster] [--cluster-thresh <thresh>]\n", argv[0]);
+            fprintf(stderr,
+                "Usage: %s --mtx <file|dir> [--embed 64|128]"
+                " [--mode csr|bcsr|all] [--cluster-thresh <thresh>]"
+                " [--csv <output.csv>]\n", argv[0]);
             return 1;
         }
     }
 
-    if (mtx_dir) {
-        run_mtx_directory(mtx_dir, embed_dim, cluster_thresh);
-        return 0;
+    if (!mtx_path) { fprintf(stderr, "No --mtx path specified.\n"); return 1; }
+
+    FILE* csv = NULL;
+    if (csv_path) {
+        csv = fopen(csv_path, "w");
+        if (!csv) { perror(csv_path); return 1; }
+        csv_write_header(csv);
+        printf("CSV output : %s\n\n", csv_path);
     }
+
+    struct stat st;
+    if (stat(mtx_path, &st) != 0) { perror(mtx_path); if (csv) fclose(csv); return 1; }
+
+    if (S_ISREG(st.st_mode)) run_mtx_file(mtx_path, embed_dim, cluster_thresh, mode, csv);
+    else if (S_ISDIR(st.st_mode)) run_mtx_directory(mtx_path, embed_dim, cluster_thresh, mode, csv);
+    else { fprintf(stderr, "--mtx: '%s' is neither a file nor a directory\n", mtx_path); if (csv) fclose(csv); return 1; }
+
+    if (csv) { fclose(csv); printf("\nResults written to %s\n", csv_path); }
+    return 0;
 }
