@@ -1,4 +1,4 @@
-This program performs sparse matrix multiplication using the Intel AMX ISA extension. Three reodering algorithms used to compare performance across sparsity patterns, dimensions and structure:
+This program performs sparse matrix multiplication using the Intel AMX ISA extension. Three reordering algorithms used to compare performance across sparsity patterns, dimensions and structure:
 * Reverse Cuthill-McKee (RCM)
 * Approximate Minimum Degree (AMD)
 * Hierarchical Clustering
