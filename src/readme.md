@@ -1,8 +1,13 @@
+This program performs sparse matrix multiplication using the Intel AMX ISA extension. Three reodering algorithms used to compare performance across sparsity patterns, dimensions and structure:
+* Reverse Cuthill-McKee (RCM)
+* Approximate Minimum Degree (AMD)
+* Hierarchical Clustering
+
 ### Requirements
 
 * GCC compiler version 22 (may work with earlier versions but this is untested)
-* SuiteSparse reordering library (if using) must be in `/src/`, it is up to the user to install and compile SuiteSparse according to their build instructions available at https://github.com/DrTimothyAldenDavis/SuiteSparse.
-* Requires a Linux machine with the Intel AMX CPU extension.
+* SuiteSparse reordering library (if using) must be in `/src/`, it is up to the user to install and compile SuiteSparse according to their build instructions (only the AMD library and its dependencies is required for operation) available at https://github.com/DrTimothyAldenDavis/SuiteSparse.
+* A Linux machine with the Intel AMX CPU extension enabled.
 
 ### Build Steps
 
